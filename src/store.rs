@@ -63,6 +63,7 @@ impl FilterConfig {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FileEvent {
     pub seq: i64,
     /// 最后一次活动对应的 last_activity 序号（单调递增，用于排序和裁剪）
@@ -141,7 +142,7 @@ impl EventStore {
             // 完成后 backup 被 drop、可变借用才释放，后面才能继续用 mem_conn 做迁移检查。
             {
                 let disk_conn = Connection::open(&disk_path)?;
-                let mut backup = Backup::new(&disk_conn, &mut mem_conn)?;
+                let backup = Backup::new(&disk_conn, &mut mem_conn)?;
                 backup.run_to_completion(100, Duration::from_millis(0), None)?;
                 // backup + disk_conn 在这里 drop
             }
