@@ -41,6 +41,10 @@ Tracing for Windows）内核日志实时捕获文件打开/读写/关闭/改名/
 - **必须以管理员身份运行**，否则启动 ETW 会话会报权限错误。
 - 全系统同一时间只能有一个 "NT Kernel Logger" 会话，如果同时开着 Process Monitor
   / xperf 之类工具会冲突。
+- 界面文本（"搜索"/"暂停"/"应用过滤" 等）依赖 Windows 系统中文字体；程序启动时会
+  按顺序尝试 `C:/Windows/Fonts/` 下的 `msyh.ttf`/`msyh.ttc`/`msyhl.ttc`/`simhei.ttf`/
+  `simsun.ttc`/`SourceHanSansSC-Regular.otf`，第一个能读到的就注入 egui 字体表。
+  都读不到时中文会退化成方块（tofu），但程序仍能运行。
 
 ## 本地编译运行
 

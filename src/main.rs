@@ -297,11 +297,60 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "EveMon - 实时文件打开监控",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            // egui 默认字体 (Hack/Ubuntu) 不含 CJK 字形，所有中文会显示为方块 (tofu)。
+            // 必须在创建 App 前注入一份中文字体到 FontDefinitions，否则界面里
+            // "搜索"/"暂停"/"应用过滤" 等所有中文标签全部看不见。
+            load_cjk_fonts(&cc.egui_ctx);
             let app = EveMonApp::new().expect(
                 "启动失败：请确认以管理员身份运行 ETW 追踪，且当前目录可写（用于 SQLite 落盘文件）",
             );
             Ok(Box::new(app))
         }),
     )
+}
+
+/// 把 Windows 系统自带的中文字体注入 egui 的 FontDefinitions。
+///
+/// 选 Proportional family 的第一个字体改为 CJK——这样英文继续走默认字体（Hack），
+/// 但 fallback 到 CJK 字体，中文能正常显示。Monospace family 把 CJK 追加到末尾做
+/// fallback，避免完全替换掉等宽字体。
+///
+/// 依次尝试候选列表里第一个能读到的字体文件；都读不到（理论上 Windows 上不可能）
+/// 就打印一行 stderr 警告然后放弃，界面会退化成方块。
+fn load_cjk_fonts(ctx: &egui::Context) {
+    const CANDIDATES: &[&str] = &[
+        // 微软雅黑（Windows 7+ 系统默认中文字体）
+        "C:/Windows/Fonts/msyh.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
+        // 微软雅黑 Light
+        "C:/Windows/Fonts/msyhl.ttc",
+        // 黑体（旧系统 fallback）
+        "C:/Windows/Fonts/simhei.ttf",
+        // 宋体（ttc 集合，ab_glyph 取第 0 个 face）
+        "C:/Windows/Fonts/simsun.ttc",
+        // 思源黑体（部分新版 Windows 自带）
+        "C:/Windows/Fonts/SourceHanSansSC-Regular.otf",
+    ];
+
+    for path in CANDIDATES {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            egui::FontData::from_owned(bytes),
+        );
+        if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            fam.insert(0, "cjk".to_owned());
+        }
+        if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            fam.push("cjk".to_owned());
+        }
+        ctx.set_fonts(fonts);
+        return;
+    }
+    eprintln!("[font] 未在 C:/Windows/Fonts/ 下找到任何 CJK 字体，中文将显示为方块");
 }
