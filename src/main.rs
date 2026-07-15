@@ -485,8 +485,8 @@ impl eframe::App for EveMonApp {
                 .column(egui_extras::Column::auto().at_least(70.0))  // PID
                 .column(egui_extras::Column::auto().at_least(140.0)) // 进程名
                 .column(egui_extras::Column::auto().at_least(90.0))  // 操作
-                .column(egui_extras::Column::remainder())            // 路径
-                .column(egui_extras::Column::auto().at_least(140.0)) // 详情
+                .column(egui_extras::Column::initial(300.0).resizable(true)) // 路径
+                .column(egui_extras::Column::remainder())            // 详情
                 .header(20.0, |mut header| {
                     header.col(|ui| { ui.strong("最后访问"); });
                     header.col(|ui| { ui.strong("次数"); });
@@ -514,22 +514,45 @@ impl eframe::App for EveMonApp {
                         });
                         row.col(|ui| { ui.label(&ev.detail); });
                         let resp = row.response();
-                        if resp.clicked() {
+                        if resp.clicked() || (resp.hovered() && ctx.input(|i| i.pointer.primary_pressed())) {
                             clicked_row = Some(idx);
                         }
                     });
                 });
         });
 
-        // 表格渲染完后再赋值。再点一下选中的行 = 取消选中。
+        // 表格渲染完后再赋值给 self.selected_row，保持选中状态而不切换。
         if let Some(idx) = clicked_row {
-            if self.selected_row == Some(idx) {
-                self.selected_row = None;
-            } else {
-                self.selected_row = Some(idx);
-                if let Some(ev) = self.frozen_rows.get(idx) {
-                    ctx.output_mut(|o| o.copied_text = ev.path.clone());
+            self.selected_row = Some(idx);
+            if let Some(ev) = self.frozen_rows.get(idx) {
+                ctx.output_mut(|o| o.copied_text = ev.path.clone());
+            }
+        }
+
+        // 键盘上下键切换选中行，支持 Windows 风格的键盘选择。
+        let current_selected = self.selected_row;
+        let mut new_idx = None;
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+            if let Some(selected) = current_selected {
+                if selected > 0 {
+                    new_idx = Some(selected - 1);
                 }
+            } else if !self.frozen_rows.is_empty() {
+                new_idx = Some(0);
+            }
+        } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+            if let Some(selected) = current_selected {
+                if selected + 1 < self.frozen_rows.len() {
+                    new_idx = Some(selected + 1);
+                }
+            } else if !self.frozen_rows.is_empty() {
+                new_idx = Some(0);
+            }
+        }
+        if let Some(idx) = new_idx {
+            self.selected_row = Some(idx);
+            if let Some(ev) = self.frozen_rows.get(idx) {
+                ctx.output_mut(|o| o.copied_text = ev.path.clone());
             }
         }
     }
