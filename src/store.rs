@@ -8,6 +8,54 @@ use rusqlite::{backup::Backup, params, Connection};
 /// 内存库里最多保留多少条事件（防止长时间运行内存无限增长）
 pub const MAX_ROWS: i64 = 20_000;
 
+/// 进程过滤配置——同时给 ETW 抓取层（决定哪些进程的事件入库）和 UI 显示层
+/// （按进程名二次过滤）使用。匹配规则是 case-insensitive 子串包含：
+/// "chrome" 会匹配 "chrome.exe"、"Chrome.exe" 但不会匹配 "chromium.exe"。
+///
+/// 两种模式可同时启用：白名单非空时进程必须命中白名单才放行；黑名单非空时命中
+/// 黑名单的进程被剔除。两个都为空表示不过滤（默认行为，保持向后兼容）。
+#[derive(Debug, Clone, Default)]
+pub struct FilterConfig {
+    /// 不为空时，仅记录进程名匹配任一关键字的进程产生的事件
+    pub whitelist: Vec<String>,
+    /// 进程名匹配任一关键字的事件一律丢弃
+    pub blacklist: Vec<String>,
+}
+
+impl FilterConfig {
+    pub fn is_empty(&self) -> bool {
+        self.whitelist.is_empty() && self.blacklist.is_empty()
+    }
+
+    /// 判断给定进程名是否应该被记录/显示。
+    /// 返回 false 表示该进程被过滤掉。
+    pub fn allows(&self, process_name: &str) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        let pname = process_name.to_lowercase();
+        if !self.whitelist.is_empty() {
+            let hit = self
+                .whitelist
+                .iter()
+                .any(|kw| !kw.trim().is_empty() && pname.contains(&kw.to_lowercase()));
+            if !hit {
+                return false;
+            }
+        }
+        if !self.blacklist.is_empty() {
+            let hit = self
+                .blacklist
+                .iter()
+                .any(|kw| !kw.trim().is_empty() && pname.contains(&kw.to_lowercase()));
+            if hit {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileEvent {
     pub seq: i64,

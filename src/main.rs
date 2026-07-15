@@ -8,13 +8,33 @@ use std::time::Duration;
 use eframe::egui;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use parking_lot::RwLock;
 
-use store::{EventStore, FileEvent};
+use store::{EventStore, FileEvent, FilterConfig};
 
 const MAX_DISPLAY_ROWS: i64 = 5000;
 /// 内存库同步到磁盘文件的频率——"以一定的频率写入硬盘"
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const DISK_DB_FILENAME: &str = "evemon_events.sqlite3";
+
+/// 抓取层过滤的模式：白名单只放行命中的进程，黑名单排除命中的进程。
+/// 关闭 = 两个列表都清空，等价于不过滤。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterMode {
+    Off,
+    Whitelist,
+    Blacklist,
+}
+
+impl FilterMode {
+    fn label(self) -> &'static str {
+        match self {
+            FilterMode::Off => "关闭",
+            FilterMode::Whitelist => "白名单",
+            FilterMode::Blacklist => "黑名单",
+        }
+    }
+}
 
 struct EveMonApp {
     store: Arc<EventStore>,
@@ -24,13 +44,24 @@ struct EveMonApp {
     paused: bool,
     frozen_rows: Vec<FileEvent>,
     total_count: i64,
+
+    /// ETW 抓取层共享的过滤配置——回调里读这个决定是否入库
+    capture_filter: Arc<RwLock<FilterConfig>>,
+    /// UI 里编辑中的过滤模式（点"应用"才同步到 capture_filter）
+    filter_mode: FilterMode,
+    /// UI 里编辑中的关键字文本（每行一个进程名片段）
+    filter_text: String,
+    /// 上一次"应用"后的过滤摘要，给状态栏显示用
+    filter_summary: String,
 }
 
 impl EveMonApp {
     fn new() -> anyhow::Result<Self> {
         let disk_path = PathBuf::from(DISK_DB_FILENAME);
         let store = EventStore::open(disk_path, FLUSH_INTERVAL)?;
-        let trace = etw::spawn_etw_capture(store.clone())?;
+        let capture_filter: Arc<RwLock<FilterConfig>> =
+            Arc::new(RwLock::new(FilterConfig::default()));
+        let trace = etw::spawn_etw_capture(store.clone(), capture_filter.clone())?;
         Ok(Self {
             store,
             _trace: trace,
@@ -39,7 +70,46 @@ impl EveMonApp {
             paused: false,
             frozen_rows: Vec::new(),
             total_count: 0,
+            capture_filter,
+            filter_mode: FilterMode::Off,
+            filter_text: String::new(),
+            filter_summary: "未启用".to_string(),
         })
+    }
+
+    /// 把 UI 里编辑中的过滤设置同步到 ETW 回调共享的 FilterConfig。
+    /// 空行和首尾空白会被忽略；模式为 Off 时清空两个列表。
+    fn apply_capture_filter(&mut self) {
+        let keywords: Vec<String> = self
+            .filter_text
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut cfg = self.capture_filter.write();
+        cfg.whitelist.clear();
+        cfg.blacklist.clear();
+        match self.filter_mode {
+            FilterMode::Off => {
+                self.filter_summary = "未启用".to_string();
+            }
+            FilterMode::Whitelist => {
+                cfg.whitelist = keywords.clone();
+                self.filter_summary = if keywords.is_empty() {
+                    "白名单(空) → 实际不过滤".to_string()
+                } else {
+                    format!("白名单: {} 个关键字", keywords.len())
+                };
+            }
+            FilterMode::Blacklist => {
+                cfg.blacklist = keywords.clone();
+                self.filter_summary = if keywords.is_empty() {
+                    "黑名单(空) → 实际不过滤".to_string()
+                } else {
+                    format!("黑名单: {} 个关键字", keywords.len())
+                };
+            }
+        }
     }
 
     /// 正常情况下每帧重新查一次库（内存 SQLite，量级到万条查询很快）；
@@ -80,6 +150,7 @@ impl eframe::App for EveMonApp {
         ctx.request_repaint_after(Duration::from_millis(300));
 
         let mut query_changed = false;
+        let mut filter_applied = false;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(6.0);
@@ -114,10 +185,49 @@ impl eframe::App for EveMonApp {
             ui.add_space(6.0);
         });
 
+        // 抓取层过滤面板（可折叠），收起时只占一行标题
+        egui::TopBottomPanel::top("capture_filter").show(ctx, |ui| {
+            egui::CollapsingHeader::new(format!("🖥  抓取层进程过滤 [{}]", self.filter_summary))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("模式:");
+                        for mode in [FilterMode::Off, FilterMode::Whitelist, FilterMode::Blacklist] {
+                            ui.radio_value(&mut self.filter_mode, mode, mode.label());
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ui.label("每行一个进程名片段（case-insensitive 子串匹配，如 chrome 匹配 chrome.exe）:");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.filter_text)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(4)
+                            .code_editor(),
+                    );
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("✓ 应用过滤").clicked() {
+                            self.apply_capture_filter();
+                            filter_applied = true;
+                        }
+                        if ui.button("清空").clicked() {
+                            self.filter_text.clear();
+                            self.filter_mode = FilterMode::Off;
+                            self.apply_capture_filter();
+                            filter_applied = true;
+                        }
+                        ui.add_space(8.0);
+                        ui.label(format!("当前生效: {}", self.filter_summary));
+                    });
+                    ui.add_space(4.0);
+                });
+        });
+
         // 不在暂停状态时，每帧都重新查询一次（下拉/输入变化，或者纯粹是新事件写入后自动刷新）
         if !self.paused {
             self.refresh();
-        } else if query_changed {
+        } else if query_changed || filter_applied {
             self.refresh();
         }
 

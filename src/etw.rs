@@ -11,7 +11,7 @@ use ferrisetw::EventRecord;
 
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-use crate::store::{EventStore, NewFileEvent};
+use crate::store::{EventStore, FilterConfig, NewFileEvent};
 
 /// FileObject -> 路径 关联表如果因为漏掉 Close 事件一直增长，超过这个阈值就整体清空重来
 /// （粗暴但简单的安全阀，正经实现应该是 LRU）
@@ -58,7 +58,10 @@ fn resolve_process_name(proc_table: &Mutex<System>, pid: u32) -> String {
 /// - FileObject -> 路径的映射是尽力而为的：如果文件在追踪启动前就已经打开了（没有
 ///   补做 rundown 枚举），或者 Close 事件丢失，对应的 Read/Write/Rename 就可能查不到
 ///   路径，界面上会显示 `<未知文件 fobj=0x..>`。
-pub fn spawn_etw_capture(store: Arc<EventStore>) -> anyhow::Result<KernelTrace> {
+pub fn spawn_etw_capture(
+    store: Arc<EventStore>,
+    capture_filter: Arc<RwLock<FilterConfig>>,
+) -> anyhow::Result<KernelTrace> {
     let proc_table = Arc::new(Mutex::new(System::new()));
     let fileobj_to_path: Arc<RwLock<HashMap<usize, String>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -84,6 +87,13 @@ pub fn spawn_etw_capture(store: Arc<EventStore>) -> anyhow::Result<KernelTrace> 
         let opcode = schema.opcode_name();
         let pid = record.process_id();
 
+        // 先解析出进程名，再做抓取层过滤——白/黑名单命中就直接 return，
+        // 不走 FileObject 映射表更新也不写库，省内存也省 SQLite 写入压力。
+        let process_name = resolve_process_name(&proc_table, pid);
+        if !capture_filter.read().allows(&process_name) {
+            return;
+        }
+
         if opcode == "Create" {
             // FileIo_Create：真正的打开事件，字段名是 OpenPath 不是 FileName
             let path = match parser.try_parse::<String>("OpenPath") {
@@ -100,7 +110,7 @@ pub fn spawn_etw_capture(store: Arc<EventStore>) -> anyhow::Result<KernelTrace> 
             let ev = NewFileEvent {
                 time_str: filetime_to_string(record.raw_timestamp()),
                 pid,
-                process_name: resolve_process_name(&proc_table, pid),
+                process_name,
                 operation: opcode,
                 path,
                 detail: String::new(),
@@ -142,7 +152,7 @@ pub fn spawn_etw_capture(store: Arc<EventStore>) -> anyhow::Result<KernelTrace> 
         let ev = NewFileEvent {
             time_str: filetime_to_string(record.raw_timestamp()),
             pid,
-            process_name: resolve_process_name(&proc_table, pid),
+            process_name,
             operation: opcode,
             path,
             detail,

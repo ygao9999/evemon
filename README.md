@@ -17,7 +17,8 @@ Tracing for Windows）内核日志实时捕获文件打开/读写/关闭/改名/
   固定频率（默认 5 秒）用 SQLite 的 Online Backup API 把内存库整体同步到磁盘文件
   `evemon_events.sqlite3`。这部分逻辑在 Linux 沙盒里**真实编译、真实跑通过**：写入、
   SQL 粗过滤（LIKE）+ Rust 侧 fuzzy 精排、重启后从磁盘读回历史、自动落盘，都单独
-  验证过，不是凭空写的。
+  验证过，不是凭空写的。本文件还定义了 `FilterConfig`（白/黑名单 + case-insensitive
+  子串匹配），同时供 ETW 抓取层和 UI 显示层复用。
 - `src/etw.rs` —— ETW 内核追踪的核心逻辑：
   - 只需启用一个 `FILE_INIT_IO_PROVIDER`（对应 `EVENT_TRACE_FLAG_FILE_IO_INIT`），
     就同时覆盖 Create（真正的打开事件）、Read/Write、Cleanup/Close/Flush、
@@ -26,8 +27,14 @@ Tracing for Windows）内核日志实时捕获文件打开/读写/关闭/改名/
     字段搞混）。其余事件只带一个 `FileObject` 指针，需要靠 Create 事件建立的
     `FileObject -> 路径` 映射表反查，这是 Process Monitor 内部的做法。
   - 用 `sysinfo` 定期刷新进程表，把事件里的 pid 翻译成进程名。
-- `src/main.rs` —— egui GUI：顶部搜索框实时模糊过滤（`fuzzy-matcher`），表格展示
-  时间/PID/进程名/操作类型/路径/详情（读写字节数、偏移量），支持暂停/清空。
+  - 回调拿到进程名后立即查 `Arc<RwLock<FilterConfig>>`，命中的进程直接 return，
+    不走 FileObject 映射表也不写库，省内存也省 SQLite 写入压力。
+- `src/main.rs` —— egui GUI：
+  - 顶部搜索框实时模糊过滤（`fuzzy-matcher`），覆盖路径/进程名/操作/详情；
+  - 可折叠"抓取层进程过滤"面板，支持白名单/黑名单两种模式，每行一个进程名片段，
+    case-insensitive 子串匹配（例如 `chrome` 匹配 `chrome.exe`/`Chrome.EXE`，
+    但不匹配 `chromium.exe`）。点"应用"即时同步到 ETW 回调，不需要重启 trace；
+  - 表格展示 时间/PID/进程名/操作类型/路径/详情（读写字节数、偏移量），支持暂停/清空。
 
 ## 运行要求
 
