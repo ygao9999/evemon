@@ -29,6 +29,11 @@ Tracing for Windows）内核日志实时捕获文件打开/读写/关闭/改名/
   - 用 `sysinfo` 定期刷新进程表，把事件里的 pid 翻译成进程名。
   - 回调拿到进程名后立即查 `Arc<RwLock<FilterConfig>>`，命中的进程直接 return，
     不走 FileObject 映射表也不写库，省内存也省 SQLite 写入压力。
+  - ETW 给的 `OpenPath` 是 NT 内核路径（`\Device\HarddiskVolume9\...`），回调里
+    用 `GetLogicalDriveStringsW` + `QueryDosDeviceW` 建立的反向映射表把它翻译成
+    Win32 路径（`C:\...`）。映射表启动时建一次，后台每 60 秒刷新一次（应对 U 盘
+    热插/网络盘挂载）。找不到匹配项时（例如 `\Device\LanmanRedirector` 网络重定向器
+    路径）原样保留，不会替换。
 - `src/main.rs` —— egui GUI：
   - 顶部搜索框实时模糊过滤（`fuzzy-matcher`），覆盖路径/进程名/操作/详情；
   - 可折叠"抓取层进程过滤"面板，支持白名单/黑名单两种模式，每行一个进程名片段，

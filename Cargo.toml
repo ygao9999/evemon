@@ -16,3 +16,4 @@ fuzzy-matcher = "0.3.7"
 parking_lot = "0.12.5"
 rusqlite = { version = "=0.31.0", default-features = false, features = ["bundled", "backup"] }
 sysinfo = "0.39"
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

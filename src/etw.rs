@@ -11,6 +11,8 @@ use ferrisetw::EventRecord;
 
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
+use windows_sys::Win32::Storage::FileSystem::{GetLogicalDriveStringsW, QueryDosDeviceW};
+
 use crate::store::{EventStore, FilterConfig, NewFileEvent};
 
 /// FileObject -> 路径 关联表如果因为漏掉 Close 事件一直增长，超过这个阈值就整体清空重来
@@ -35,6 +37,89 @@ fn resolve_process_name(proc_table: &Mutex<System>, pid: u32) -> String {
         .process(Pid::from_u32(pid))
         .map(|p| p.name().to_string_lossy().to_string())
         .unwrap_or_else(|| format!("pid:{pid}"))
+}
+
+/// 把 UTF-8 字符串编码成 0 结尾的 UTF-16，给 widestring 版本的 Win32 API 用。
+fn to_wide_zstr(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 把 0 结尾的 UTF-16 buffer 解码成 String（在第一个 NUL 处截断）。
+fn from_wide_zstr(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+/// 通过 GetLogicalDriveStringsW + QueryDosDeviceW 构建反向映射表：
+///   "\Device\HarddiskVolume9" -> "C:"
+///   "\Device\HarddiskVolume2" -> "D:"
+/// 这样 ETW 给的 NT 内核路径 `\Device\HarddiskVolume9\Windows\System32`
+/// 能翻译成用户能看懂的 `C:\Windows\System32`。
+///
+/// 失败时返回空表（不是 None），调用方按"翻译不了就保留原路径"处理。
+fn build_device_to_drive_map() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+
+    // GetLogicalDriveStringsW 返回形如 "C:\\\0D:\\\0E:\\\0\0" 的双 0 结尾串
+    let mut buf = [0u16; 512];
+    let len = unsafe { GetLogicalDriveStringsW(buf.len() as u32, buf.as_mut_ptr()) };
+    if len == 0 || len as usize >= buf.len() {
+        return map;
+    }
+    let drives_str = String::from_utf16_lossy(&buf[..len as usize]);
+
+    // 每段形如 "C:\"；去掉尾部反斜杠得到 "C:"
+    for drive in drives_str.split('\0').filter(|s| !s.is_empty()) {
+        let drive_letter = drive.trim_end_matches('\\');
+        if drive_letter.len() < 2 {
+            continue;
+        }
+        let wide_drive = to_wide_zstr(drive_letter);
+        let mut dev_buf = [0u16; 512];
+        // QueryDosDeviceW("C:") 返回 "\Device\HarddiskVolume9\0"
+        let dev_len = unsafe {
+            QueryDosDeviceW(
+                wide_drive.as_ptr(),
+                dev_buf.as_mut_ptr(),
+                dev_buf.len() as u32,
+            )
+        };
+        if dev_len == 0 {
+            continue;
+        }
+        let dev_path = from_wide_zstr(&dev_buf[..dev_len as usize]);
+        if !dev_path.is_empty() {
+            map.insert(dev_path, drive_letter.to_string());
+        }
+    }
+
+    map
+}
+
+/// 用反向映射表把 NT 内核路径翻译成 Win32 路径。
+///
+/// 例如 map 里有 "\Device\HarddiskVolume9" -> "C:"，则
+///   `\Device\HarddiskVolume9\Windows\System32\notepad.exe`
+///   → `C:\Windows\System32\notepad.exe`
+///
+/// 关键：前缀匹配必须验证紧跟着的字符是 `\`（或字符串结束），否则
+/// "\Device\HarddiskVolume1" 会误匹配 "\Device\HarddiskVolume10\foo"
+/// 替换出 `C:0\foo` 这种垃圾。
+///
+/// 找不到匹配项时原样返回（例如网络重定向器路径 \Device\LanmanRedirector，
+/// 或者映射表刷新滞后时插入的 U 盘等）。
+fn translate_nt_path(nt_path: &str, map: &HashMap<String, String>) -> String {
+    if nt_path.is_empty() || !nt_path.starts_with('\\') {
+        return nt_path.to_string();
+    }
+    for (device, drive) in map {
+        if let Some(rest) = nt_path.strip_prefix(device.as_str()) {
+            if rest.is_empty() || rest.starts_with('\\') {
+                return format!("{drive}{rest}");
+            }
+        }
+    }
+    nt_path.to_string()
 }
 
 /// 启动 ETW 内核 FileIo 追踪，捕获文件打开/读写/关闭/改名/删除等事件，写入 SQLite 内存库。
@@ -66,6 +151,20 @@ pub fn spawn_etw_capture(
     let fileobj_to_path: Arc<RwLock<HashMap<usize, String>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
+    // NT 设备路径 -> 盘符的反向映射表。ETW 给的 OpenPath 是
+    // \Device\HarddiskVolume9\... 这种内核路径，需要翻译成 C:\... 才能看懂。
+    // 启动时建一次表，之后后台线程每 60 秒刷一次（U 盘热插、网络盘挂载会让映射变化）。
+    let device_to_drive: Arc<RwLock<HashMap<String, String>>> =
+        Arc::new(RwLock::new(build_device_to_drive_map()));
+    {
+        let device_to_drive = device_to_drive.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let fresh = build_device_to_drive_map();
+            *device_to_drive.write() = fresh;
+        });
+    }
+
     // 独立线程周期性刷新进程表，用于把事件里的 pid 翻译成进程名。
     // 不在 ETW 回调里直接刷新，是因为回调线程要保持低延迟，不能被整表刷新阻塞。
     {
@@ -96,15 +195,19 @@ pub fn spawn_etw_capture(
 
         if opcode == "Create" {
             // FileIo_Create：真正的打开事件，字段名是 OpenPath 不是 FileName
-            let path = match parser.try_parse::<String>("OpenPath") {
+            let raw_path = match parser.try_parse::<String>("OpenPath") {
                 Ok(p) if !p.is_empty() => p,
                 _ => return,
             };
+            // 把 \Device\HarddiskVolume9\... 翻译成 C:\...
+            let path = translate_nt_path(&raw_path, &device_to_drive.read());
             if let Ok(fobj) = parser.try_parse::<Pointer>("FileObject") {
                 let mut map = fileobj_to_path.write();
                 if map.len() > MAX_FILEOBJ_MAP {
                     map.clear();
                 }
+                // 注意：FileObject 映射表里也存翻译后的路径，这样后续 Read/Write/Close
+                // 反查时拿到的就是 Win32 路径，不用每次都查 device_to_drive
                 map.insert(*fobj, path.clone());
             }
             let ev = NewFileEvent {
