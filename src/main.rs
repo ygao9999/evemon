@@ -218,8 +218,8 @@ impl EveMonApp {
 
     /// 正常情况下每帧重新查一次库（内存 SQLite，量级到万条查询很快）；
     /// 暂停时冻结在暂停那一刻，方便仔细看某一条记录，不被持续写入的新事件打断。
-    fn refresh(&mut self) {
-        if self.paused {
+    fn refresh(&mut self, force: bool) {
+        if self.paused && !force {
             return;
         }
         self.total_count = self.store.count().unwrap_or(0);
@@ -291,12 +291,19 @@ impl eframe::App for EveMonApp {
                 }
             });
             ui.add_space(4.0);
+            let refresh_status = if self.paused {
+                " · 已暂停刷新"
+            } else if !self.query.is_empty() {
+                " · 搜索中已暂停动态刷新"
+            } else {
+                ""
+            };
             ui.label(format!(
                 "内存库共 {} 条唯一路径 · 每 {} 秒自动同步到磁盘文件 {}{}",
                 self.total_count,
                 FLUSH_INTERVAL.as_secs(),
                 DISK_DB_FILENAME,
-                if self.paused { " · 已暂停刷新" } else { "" }
+                refresh_status
             ));
             ui.add_space(6.0);
         });
@@ -376,11 +383,20 @@ impl eframe::App for EveMonApp {
             ui.add_space(2.0);
         });
 
-        // 不在暂停状态时，每帧都重新查询一次（下拉/输入变化，或者纯粹是新事件写入后自动刷新）
-        if !self.paused {
-            self.refresh();
-        } else if query_changed || filter_applied {
-            self.refresh();
+        // 根据搜索和暂停状态决定是否执行刷新
+        let force_refresh = query_changed || filter_applied;
+        let should_refresh = if self.paused {
+            force_refresh
+        } else if !self.query.is_empty() {
+            // 输入搜索文字后，停止动态刷新，仅在搜索词或过滤改变时刷新显示结果
+            force_refresh
+        } else {
+            // 清空搜索文字后，恢复动态刷新
+            true
+        };
+
+        if should_refresh {
+            self.refresh(force_refresh);
         }
 
         // Esc 取消选中行
