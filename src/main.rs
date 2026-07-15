@@ -77,10 +77,15 @@ struct EveMonApp {
 
 impl EveMonApp {
     fn new() -> anyhow::Result<Self> {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(PathBuf::new);
+
         // 启动时读取配置文件（不存在则默认全 off）。
         // 读到的过滤配置立即同步到 ETW 回调共享的 FilterConfig / PathFilterConfig，
         // 同时初始化 UI 里的编辑状态，保证启动后界面显示和实际生效的过滤一致。
-        let config_path = PathBuf::from(CONFIG_FILENAME);
+        let config_path = exe_dir.join(CONFIG_FILENAME);
         let cfg = config::load(&config_path)?;
         let proc_filter = cfg.to_process_filter();
         let path_filter_cfg = cfg.to_path_filter();
@@ -91,7 +96,7 @@ impl EveMonApp {
             Duration::from_secs(cfg.flush_interval_secs)
         };
 
-        let disk_path = PathBuf::from(DISK_DB_FILENAME);
+        let disk_path = exe_dir.join(DISK_DB_FILENAME);
         let store = EventStore::open(disk_path, flush_interval)?;
 
         let capture_filter: Arc<RwLock<FilterConfig>> =
