@@ -118,14 +118,6 @@ impl FilterConfig {
         }
     }
 
-    pub fn whitelist(&self) -> &[String] {
-        &self.whitelist
-    }
-
-    pub fn blacklist(&self) -> &[String] {
-        &self.blacklist
-    }
-
     pub fn is_empty(&self) -> bool {
         self.whitelist.is_empty() && self.blacklist.is_empty()
     }
@@ -189,14 +181,6 @@ impl PathFilterConfig {
             whitelist_matchers,
             blacklist_matchers,
         }
-    }
-
-    pub fn whitelist(&self) -> &[String] {
-        &self.whitelist
-    }
-
-    pub fn blacklist(&self) -> &[String] {
-        &self.blacklist
     }
 
     pub fn is_empty(&self) -> bool {
