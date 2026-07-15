@@ -63,31 +63,27 @@ impl AppConfig {
     /// 把 DTO 转成 ETW 回调用的 FilterConfig。Off / 空 keywords 时返回空 config
     /// （等价于不过滤），避免回调里每次都查 mode。
     pub fn to_process_filter(&self) -> FilterConfig {
-        let mut cfg = FilterConfig::default();
         match self.process_filter.mode {
-            FilterModeDto::Off => {}
+            FilterModeDto::Off => FilterConfig::default(),
             FilterModeDto::Whitelist => {
-                cfg.whitelist = trim_keywords(&self.process_filter.keywords);
+                FilterConfig::new(trim_keywords(&self.process_filter.keywords), Vec::new())
             }
             FilterModeDto::Blacklist => {
-                cfg.blacklist = trim_keywords(&self.process_filter.keywords);
+                FilterConfig::new(Vec::new(), trim_keywords(&self.process_filter.keywords))
             }
         }
-        cfg
     }
 
     pub fn to_path_filter(&self) -> PathFilterConfig {
-        let mut cfg = PathFilterConfig::default();
         match self.path_filter.mode {
-            FilterModeDto::Off => {}
+            FilterModeDto::Off => PathFilterConfig::default(),
             FilterModeDto::Whitelist => {
-                cfg.whitelist = trim_keywords(&self.path_filter.keywords);
+                PathFilterConfig::new(trim_keywords(&self.path_filter.keywords), Vec::new())
             }
             FilterModeDto::Blacklist => {
-                cfg.blacklist = trim_keywords(&self.path_filter.keywords);
+                PathFilterConfig::new(Vec::new(), trim_keywords(&self.path_filter.keywords))
             }
         }
-        cfg
     }
 }
 

@@ -69,6 +69,10 @@ struct EveMonApp {
 
     /// 配置文件路径，点"应用"时把进程 + 路径过滤都写回这个文件
     config_path: PathBuf,
+
+    /// 当前选中的行索引（在 frozen_rows 里的下标）。None 表示没选中。
+    /// 点表格行选中，Esc 取消选中。选中行高亮显示，底部详情面板显示完整路径。
+    selected_row: Option<usize>,
 }
 
 impl EveMonApp {
@@ -121,12 +125,14 @@ impl EveMonApp {
             path_filter_text,
             path_filter_summary,
             config_path,
+            selected_row: None,
         })
     }
 
     /// 把 UI 里编辑中的进程过滤设置同步到 ETW 回调共享的 FilterConfig，
     /// 同时把路径过滤也一起同步，最后把完整 AppConfig 写回文件。
     /// 空行和首尾空白会被忽略；模式为 Off 时清空两个列表。
+    /// glob 模式的关键字（含 * ? [ {）会被 FilterConfig::new 编译成 GlobMatcher。
     fn apply_filters_and_save(&mut self) {
         // 进程过滤
         let proc_keywords: Vec<String> = self
@@ -136,30 +142,29 @@ impl EveMonApp {
             .filter(|s| !s.is_empty())
             .collect();
         {
-            let mut cfg = self.capture_filter.write();
-            cfg.whitelist.clear();
-            cfg.blacklist.clear();
-            match self.filter_mode {
+            let new_cfg = match self.filter_mode {
                 FilterMode::Off => {
                     self.filter_summary = "未启用".to_string();
+                    FilterConfig::default()
                 }
                 FilterMode::Whitelist => {
-                    cfg.whitelist = proc_keywords.clone();
                     self.filter_summary = if proc_keywords.is_empty() {
                         "白名单(空) → 实际不过滤".to_string()
                     } else {
                         format!("白名单: {} 个关键字", proc_keywords.len())
                     };
+                    FilterConfig::new(proc_keywords.clone(), Vec::new())
                 }
                 FilterMode::Blacklist => {
-                    cfg.blacklist = proc_keywords.clone();
                     self.filter_summary = if proc_keywords.is_empty() {
                         "黑名单(空) → 实际不过滤".to_string()
                     } else {
                         format!("黑名单: {} 个关键字", proc_keywords.len())
                     };
+                    FilterConfig::new(Vec::new(), proc_keywords.clone())
                 }
-            }
+            };
+            *self.capture_filter.write() = new_cfg;
         }
 
         // 路径过滤
@@ -170,30 +175,29 @@ impl EveMonApp {
             .filter(|s| !s.is_empty())
             .collect();
         {
-            let mut cfg = self.path_filter.write();
-            cfg.whitelist.clear();
-            cfg.blacklist.clear();
-            match self.path_filter_mode {
+            let new_cfg = match self.path_filter_mode {
                 FilterMode::Off => {
                     self.path_filter_summary = "未启用".to_string();
+                    PathFilterConfig::default()
                 }
                 FilterMode::Whitelist => {
-                    cfg.whitelist = path_keywords.clone();
                     self.path_filter_summary = if path_keywords.is_empty() {
                         "白名单(空) → 实际不过滤".to_string()
                     } else {
                         format!("白名单: {} 个关键字", path_keywords.len())
                     };
+                    PathFilterConfig::new(path_keywords.clone(), Vec::new())
                 }
                 FilterMode::Blacklist => {
-                    cfg.blacklist = path_keywords.clone();
                     self.path_filter_summary = if path_keywords.is_empty() {
                         "黑名单(空) → 实际不过滤".to_string()
                     } else {
                         format!("黑名单: {} 个关键字", path_keywords.len())
                     };
+                    PathFilterConfig::new(Vec::new(), path_keywords.clone())
                 }
-            }
+            };
+            *self.path_filter.write() = new_cfg;
         }
 
         // 持久化。save 失败不阻塞 UI，只打 stderr 提示用户。
@@ -222,30 +226,38 @@ impl EveMonApp {
 
         if self.query.is_empty() {
             self.frozen_rows = self.store.recent(MAX_DISPLAY_ROWS).unwrap_or_default();
-            return;
+        } else {
+            // 先用 SQL LIKE 做一次粗过滤缩小候选集，再用 fuzzy-matcher 精排，
+            // 兼顾"库里几万条也查得快"和"排序看起来跟 Everything 一样顺眼"。
+            // hay 里带上 count，这样搜"47"这种数字也能命中被打开 47 次的路径。
+            let candidates = self
+                .store
+                .search(&self.query, MAX_DISPLAY_ROWS)
+                .unwrap_or_default();
+            let mut scored: Vec<(i64, FileEvent)> = candidates
+                .into_iter()
+                .filter_map(|e| {
+                    let hay = format!(
+                        "{} {} {} {} {}",
+                        e.path, e.process_name, e.operation, e.detail, e.count
+                    );
+                    self.matcher
+                        .fuzzy_match(&hay, &self.query)
+                        .map(|s| (s, e))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            self.frozen_rows = scored.into_iter().map(|(_, e)| e).collect();
         }
 
-        // 先用 SQL LIKE 做一次粗过滤缩小候选集，再用 fuzzy-matcher 精排，
-        // 兼顾"库里几万条也查得快"和"排序看起来跟 Everything 一样顺眼"。
-        // hay 里带上 count，这样搜"47"这种数字也能命中被打开 47 次的路径。
-        let candidates = self
-            .store
-            .search(&self.query, MAX_DISPLAY_ROWS)
-            .unwrap_or_default();
-        let mut scored: Vec<(i64, FileEvent)> = candidates
-            .into_iter()
-            .filter_map(|e| {
-                let hay = format!(
-                    "{} {} {} {} {}",
-                    e.path, e.process_name, e.operation, e.detail, e.count
-                );
-                self.matcher
-                    .fuzzy_match(&hay, &self.query)
-                    .map(|s| (s, e))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
-        self.frozen_rows = scored.into_iter().map(|(_, e)| e).collect();
+        // 选中行索引可能因为行数变化而越界，越界就清空。
+        // 不在这里按 path 重新定位——refresh 每帧都跑，按 path 找回代价太高，
+        // 而且连续刷新里 frozen_rows 顺序通常是稳定的，简单清空更可预测。
+        if let Some(idx) = self.selected_row {
+            if idx >= self.frozen_rows.len() {
+                self.selected_row = None;
+            }
+        }
     }
 }
 
@@ -302,7 +314,7 @@ impl eframe::App for EveMonApp {
                         }
                     });
                     ui.add_space(2.0);
-                    ui.label("每行一个进程名片段（case-insensitive 子串匹配，如 chrome 匹配 chrome.exe）:");
+                    ui.label("每行一个进程名关键字。不含通配符时为 case-insensitive 子串匹配（chrome 命中 chrome.exe）；含 * ? [ { 时为 glob（chrome.* 命中 chrome.exe）:");
                     ui.add(
                         egui::TextEdit::multiline(&mut self.filter_text)
                             .desired_width(f32::INFINITY)
@@ -325,7 +337,7 @@ impl eframe::App for EveMonApp {
                         }
                     });
                     ui.add_space(2.0);
-                    ui.label("每行一个路径片段（case-insensitive 子串匹配，如 D:\\work_flow 匹配 D:\\work_flow\\拦截activity\\...）:");
+                    ui.label("每行一个路径关键字。不含通配符时为 case-insensitive 子串匹配（D:\\work_flow 命中 D:\\work_flow\\拦截activity\\...）；含 * ? [ { 时为 glob（D:\\work_flow\\**\\*.java 命中任意深度的 .java）:");
                     ui.add(
                         egui::TextEdit::multiline(&mut self.path_filter_text)
                             .desired_width(f32::INFINITY)
@@ -371,6 +383,66 @@ impl eframe::App for EveMonApp {
             self.refresh();
         }
 
+        // Esc 取消选中行
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.selected_row = None;
+        }
+
+        // 底部详情面板——显示选中行的完整路径和详情。路径在表格里可能被截断，
+        // 这里用全宽 Label + wrap，保证看得到完整内容。没选中时显示提示。
+        egui::TopBottomPanel::bottom("detail").show(ctx, |ui| {
+            ui.add_space(4.0);
+            if let Some(idx) = self.selected_row {
+                if let Some(ev) = self.frozen_rows.get(idx) {
+                    ui.horizontal(|ui| {
+                        ui.strong("选中:");
+                        ui.label(format!(
+                            "#{} · {} · PID {} · {} · count {}",
+                            idx + 1,
+                            ev.time_str,
+                            ev.pid,
+                            ev.process_name,
+                            ev.count
+                        ));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.strong("路径:");
+                        ui.add(
+                            egui::Label::new(&ev.path)
+                                .wrap(true)
+                                .selectable(true),
+                        );
+                    });
+                    if !ev.detail.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.strong("详情:");
+                            ui.label(&ev.detail);
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("📋 复制路径").clicked() {
+                            ui.output_mut(|o| o.copied_text = ev.path.clone().into());
+                        }
+                        if ui.button("取消选中 (Esc)").clicked() {
+                            self.selected_row = None;
+                        }
+                    });
+                } else {
+                    ui.label("（选中行已不存在）");
+                }
+            } else {
+                ui.label("点击表格任意一行查看完整路径 · Esc 取消选中");
+            }
+            ui.add_space(4.0);
+        });
+
+        // 表格主体。行选中逻辑：
+        // - row.set_selected(idx == self.selected_row) 让选中行高亮
+        // - row.response().clicked() 点击时记录到局部 clicked_row
+        // - 表格渲染完后再赋值给 self.selected_row，避免和 frozen_rows 的不可变借用冲突
+        let mut clicked_row: Option<usize> = None;
+        let selected = self.selected_row;
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let rows = &self.frozen_rows;
             egui_extras::TableBuilder::new(ui)
@@ -383,55 +455,47 @@ impl eframe::App for EveMonApp {
                 .column(egui_extras::Column::remainder())            // 路径
                 .column(egui_extras::Column::auto().at_least(140.0)) // 详情
                 .header(20.0, |mut header| {
-                    header.col(|ui| {
-                        ui.strong("最后访问");
-                    });
-                    header.col(|ui| {
-                        ui.strong("次数");
-                    });
-                    header.col(|ui| {
-                        ui.strong("PID");
-                    });
-                    header.col(|ui| {
-                        ui.strong("进程");
-                    });
-                    header.col(|ui| {
-                        ui.strong("操作");
-                    });
-                    header.col(|ui| {
-                        ui.strong("路径");
-                    });
-                    header.col(|ui| {
-                        ui.strong("详情");
-                    });
+                    header.col(|ui| { ui.strong("最后访问"); });
+                    header.col(|ui| { ui.strong("次数"); });
+                    header.col(|ui| { ui.strong("PID"); });
+                    header.col(|ui| { ui.strong("进程"); });
+                    header.col(|ui| { ui.strong("操作"); });
+                    header.col(|ui| { ui.strong("路径"); });
+                    header.col(|ui| { ui.strong("详情"); });
                 })
                 .body(|body| {
                     body.rows(20.0, rows.len(), |mut row| {
-                        let ev = &rows[row.index()];
+                        let idx = row.index();
+                        row.set_selected(selected == Some(idx));
+                        let ev = &rows[idx];
+                        row.col(|ui| { ui.label(&ev.time_str); });
+                        row.col(|ui| { ui.label(ev.count.to_string()); });
+                        row.col(|ui| { ui.label(ev.pid.to_string()); });
+                        row.col(|ui| { ui.label(&ev.process_name); });
+                        row.col(|ui| { ui.label(&ev.operation); });
                         row.col(|ui| {
-                            ui.label(&ev.time_str);
+                            ui.add(
+                                egui::Label::new(&ev.path)
+                                    .truncate(),
+                            );
                         });
-                        row.col(|ui| {
-                            ui.label(ev.count.to_string());
-                        });
-                        row.col(|ui| {
-                            ui.label(ev.pid.to_string());
-                        });
-                        row.col(|ui| {
-                            ui.label(&ev.process_name);
-                        });
-                        row.col(|ui| {
-                            ui.label(&ev.operation);
-                        });
-                        row.col(|ui| {
-                            ui.label(&ev.path);
-                        });
-                        row.col(|ui| {
-                            ui.label(&ev.detail);
-                        });
+                        row.col(|ui| { ui.label(&ev.detail); });
+                        let resp = row.response();
+                        if resp.clicked() {
+                            clicked_row = Some(idx);
+                        }
                     });
                 });
         });
+
+        // 表格渲染完后再赋值。再点一下选中的行 = 取消选中。
+        if let Some(idx) = clicked_row {
+            if self.selected_row == Some(idx) {
+                self.selected_row = None;
+            } else {
+                self.selected_row = Some(idx);
+            }
+        }
     }
 }
 

@@ -13,6 +13,7 @@ egui = "=0.28.1"
 egui_extras = "=0.28.1"
 ferrisetw = "1.2.0"
 fuzzy-matcher = "0.3.7"
+globset = "0.4"
 parking_lot = "0.12.5"
 rusqlite = { version = "=0.31.0", default-features = false, features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }

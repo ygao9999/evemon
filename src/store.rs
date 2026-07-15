@@ -14,21 +14,118 @@ pub const MAX_ROWS: i64 = 20_000;
 /// v1：path UNIQUE + count + first_seen + last_activity 列
 const SCHEMA_VERSION: i64 = 1;
 
-/// 进程过滤配置——同时给 ETW 抓取层（决定哪些进程的事件入库）和 UI 显示层
-/// （按进程名二次过滤）使用。匹配规则是 case-insensitive 子串包含：
-/// "chrome" 会匹配 "chrome.exe"、"Chrome.exe" 但不会匹配 "chromium.exe"。
+/// 编译后的单个关键字匹配器。
 ///
-/// 两种模式可同时启用：白名单非空时进程必须命中白名单才放行；黑名单非空时命中
-/// 黑名单的进程被剔除。两个都为空表示不过滤（默认行为，保持向后兼容）。
-#[derive(Debug, Clone, Default)]
+/// 匹配规则：
+/// - 关键字含 glob 元字符（`*` `?` `[` `{`）时，编译成 case-insensitive 的
+///   [`globset::GlobMatcher`](globset) 对完整字符串做 glob 匹配。
+///   - `D:\work_flow\**\*.java` 命中 `D:\work_flow\sub\foo.java`
+///   - `chrome.*` 命中 `chrome.exe` 但不命中 `chrome` （glob 是完整匹配不是子串）
+/// - 关键字不含 glob 元字符时，做 case-insensitive 子串包含匹配（向后兼容）：
+///   - `chrome` 命中 `chrome.exe`、`chromium.exe`、`Chrome.EXE`
+///   - `D:\work_flow` 命中 `D:\work_flow\foo\bar.java`
+///
+/// glob 编译失败的（语法错误）关键字会被跳过——不会命中任何字符串，等价于不存在。
+#[derive(Clone)]
+enum MatcherEntry {
+    /// 已经 lower 过的子串关键字，待匹配的字符串也要 lower 后比较
+    Substring(String),
+    /// 编译好的 glob matcher，构造时已经设了 case_insensitive
+    Glob(globset::GlobMatcher),
+}
+
+impl MatcherEntry {
+    /// 把原始关键字字符串编译成 MatcherEntry。trim 后为空返回 None（调用方自己跳过）。
+    fn compile(raw: &str) -> Option<Self> {
+        let kw = raw.trim();
+        if kw.is_empty() {
+            return None;
+        }
+        if has_glob_meta(kw) {
+            // case_insensitive 让 chrome.* 匹配 Chrome.EXE，和子串模式行为一致
+            match globset::GlobBuilder::new(kw)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(glob) => Some(MatcherEntry::Glob(glob.compile_matcher())),
+                Err(e) => {
+                    eprintln!("[filter] glob 模式 {kw:?} 编译失败: {e}，已跳过");
+                    None
+                }
+            }
+        } else {
+            Some(MatcherEntry::Substring(kw.to_lowercase()))
+        }
+    }
+
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            MatcherEntry::Substring(kw) => value.to_lowercase().contains(kw),
+            // globset 的 matcher 已经 case_insensitive，直接喂原始 value
+            MatcherEntry::Glob(m) => m.is_match(value),
+        }
+    }
+}
+
+/// 判断关键字是否含有 glob 元字符。`!` 只在 `[!...]` 里有意义，不单独算。
+fn has_glob_meta(s: &str) -> bool {
+    s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
+}
+
+/// 一个完整的过滤器：白名单 + 黑名单，内部缓存了编译后的 matcher，避免每条 ETW 事件
+/// 都重新编译 glob。`set_whitelist` / `set_blacklist` 在更新关键字的同时重建缓存。
+///
+/// 两个模式可同时启用：白名单非空时必须命中白名单才放行；黑名单非空时命中黑名单
+/// 的被剔除。两个都空表示不过滤（默认行为）。
+#[derive(Clone)]
 pub struct FilterConfig {
-    /// 不为空时，仅记录进程名匹配任一关键字的进程产生的事件
-    pub whitelist: Vec<String>,
-    /// 进程名匹配任一关键字的事件一律丢弃
-    pub blacklist: Vec<String>,
+    whitelist: Vec<String>,
+    blacklist: Vec<String>,
+    whitelist_matchers: Vec<MatcherEntry>,
+    blacklist_matchers: Vec<MatcherEntry>,
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        Self {
+            whitelist: Vec::new(),
+            blacklist: Vec::new(),
+            whitelist_matchers: Vec::new(),
+            blacklist_matchers: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for FilterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilterConfig")
+            .field("whitelist", &self.whitelist)
+            .field("blacklist", &self.blacklist)
+            .finish()
+    }
 }
 
 impl FilterConfig {
+    /// 从白名单 + 黑名单关键字列表构造，同时编译 matcher 缓存。
+    pub fn new(whitelist: Vec<String>, blacklist: Vec<String>) -> Self {
+        let whitelist_matchers = whitelist.iter().filter_map(|s| MatcherEntry::compile(s)).collect();
+        let blacklist_matchers = blacklist.iter().filter_map(|s| MatcherEntry::compile(s)).collect();
+        Self {
+            whitelist,
+            blacklist,
+            whitelist_matchers,
+            blacklist_matchers,
+        }
+    }
+
+    pub fn whitelist(&self) -> &[String] {
+        &self.whitelist
+    }
+
+    pub fn blacklist(&self) -> &[String] {
+        &self.blacklist
+    }
+
     pub fn is_empty(&self) -> bool {
         self.whitelist.is_empty() && self.blacklist.is_empty()
     }
@@ -39,22 +136,13 @@ impl FilterConfig {
         if self.is_empty() {
             return true;
         }
-        let pname = process_name.to_lowercase();
-        if !self.whitelist.is_empty() {
-            let hit = self
-                .whitelist
-                .iter()
-                .any(|kw| !kw.trim().is_empty() && pname.contains(&kw.to_lowercase()));
-            if !hit {
+        if !self.whitelist_matchers.is_empty() {
+            if !self.whitelist_matchers.iter().any(|m| m.matches(process_name)) {
                 return false;
             }
         }
-        if !self.blacklist.is_empty() {
-            let hit = self
-                .blacklist
-                .iter()
-                .any(|kw| !kw.trim().is_empty() && pname.contains(&kw.to_lowercase()));
-            if hit {
+        if !self.blacklist_matchers.is_empty() {
+            if self.blacklist_matchers.iter().any(|m| m.matches(process_name)) {
                 return false;
             }
         }
@@ -62,19 +150,55 @@ impl FilterConfig {
     }
 }
 
-/// 路径过滤配置——语义和 FilterConfig 完全对称，只是作用于 ETW 事件里的 path
-/// 字段。匹配规则是 case-insensitive 子串包含，所以 `D:\work_flow` 会同时命中
-/// `D:\work_flow\xxx` 和 `d:\WORK_FLOW\YYY`。
+/// 路径过滤配置——语义和 FilterConfig 完全对称，只是作用于 ETW 事件里的 path 字段。
 ///
 /// 路径过滤在 NT 路径翻译完成之后才做，所以关键字写 Win32 路径就行
 /// （`C:\Windows` 而不是 `\Device\HarddiskVolume9\Windows`）。
-#[derive(Debug, Clone, Default)]
+///
+/// 支持两种匹配方式（每个关键字独立判断）：
+/// - **子串匹配**（默认）：`D:\work_flow` 命中任何包含该子串的路径。case-insensitive。
+/// - **glob 匹配**：关键字含 `*` `?` `[` `{` 之一时启用。例如：
+///   - `D:\work_flow\**\*.java` 命中该目录下任意深度的 .java 文件
+///   - `*.tmp` 命中任何以 .tmp 结尾的文件（注意 glob `*` 不跨路径分隔符，所以
+///     `*.tmp` 只命中 `foo.tmp` 不命中 `dir\foo.tmp`；要跨目录用 `**\*.tmp`）
+///   - `{*.log,*.bak}` 命中 .log 或 .bak
+#[derive(Clone, Default)]
 pub struct PathFilterConfig {
-    pub whitelist: Vec<String>,
-    pub blacklist: Vec<String>,
+    whitelist: Vec<String>,
+    blacklist: Vec<String>,
+    whitelist_matchers: Vec<MatcherEntry>,
+    blacklist_matchers: Vec<MatcherEntry>,
+}
+
+impl std::fmt::Debug for PathFilterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PathFilterConfig")
+            .field("whitelist", &self.whitelist)
+            .field("blacklist", &self.blacklist)
+            .finish()
+    }
 }
 
 impl PathFilterConfig {
+    pub fn new(whitelist: Vec<String>, blacklist: Vec<String>) -> Self {
+        let whitelist_matchers = whitelist.iter().filter_map(|s| MatcherEntry::compile(s)).collect();
+        let blacklist_matchers = blacklist.iter().filter_map(|s| MatcherEntry::compile(s)).collect();
+        Self {
+            whitelist,
+            blacklist,
+            whitelist_matchers,
+            blacklist_matchers,
+        }
+    }
+
+    pub fn whitelist(&self) -> &[String] {
+        &self.whitelist
+    }
+
+    pub fn blacklist(&self) -> &[String] {
+        &self.blacklist
+    }
+
     pub fn is_empty(&self) -> bool {
         self.whitelist.is_empty() && self.blacklist.is_empty()
     }
@@ -85,22 +209,13 @@ impl PathFilterConfig {
         if self.is_empty() {
             return true;
         }
-        let p = path.to_lowercase();
-        if !self.whitelist.is_empty() {
-            let hit = self
-                .whitelist
-                .iter()
-                .any(|kw| !kw.trim().is_empty() && p.contains(&kw.to_lowercase()));
-            if !hit {
+        if !self.whitelist_matchers.is_empty() {
+            if !self.whitelist_matchers.iter().any(|m| m.matches(path)) {
                 return false;
             }
         }
-        if !self.blacklist.is_empty() {
-            let hit = self
-                .blacklist
-                .iter()
-                .any(|kw| !kw.trim().is_empty() && p.contains(&kw.to_lowercase()));
-            if hit {
+        if !self.blacklist_matchers.is_empty() {
+            if self.blacklist_matchers.iter().any(|m| m.matches(path)) {
                 return false;
             }
         }

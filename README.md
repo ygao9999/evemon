@@ -18,8 +18,15 @@ Tracing for Windows）内核日志实时捕获文件打开/读写/关闭/改名/
   `evemon_events.sqlite3`。这部分逻辑在 Linux 沙盒里**真实编译、真实跑通过**：写入、
   SQL 粗过滤（LIKE）+ Rust 侧 fuzzy 精排、重启后从磁盘读回历史、自动落盘，都单独
   验证过，不是凭空写的。本文件还定义了 `FilterConfig`（进程过滤）和
-  `PathFilterConfig`（路径过滤），都是白/黑名单 + case-insensitive 子串匹配，
-  同时供 ETW 抓取层和 UI 显示层复用。
+  `PathFilterConfig`（路径过滤），都是白/黑名单 + 混合匹配，同时供 ETW 抓取层和 UI
+  显示层复用。
+  - **关键字匹配规则**（每个关键字独立判断）：
+    - 不含 glob 元字符（`*` `?` `[` `{`）时，做 case-insensitive 子串包含匹配。
+      例如 `chrome` 命中 `chrome.exe`、`chromium.exe`；`D:\work_flow` 命中该目录下
+      任意路径。
+    - 含 glob 元字符时，编译成 case-insensitive 的 `globset::GlobMatcher` 对完整
+      字符串做 glob 匹配。例如 `D:\work_flow\**\*.java` 命中该目录下任意深度的 .java
+      文件；`chrome.*` 命中 `chrome.exe` 但不命中 `chromium.exe`（glob 是完整匹配）。
   - **路径去重**：表里 `path` 是 UNIQUE 的，同一个路径只允许一行。重复打开同一个
     文件触发的 `ON CONFLICT(path) DO UPDATE` 只累加 `count`、把 `last_activity` /
     `time_str` / `pid` / `process_name` / `operation` / `detail` 更新为本次最新的值，
@@ -33,6 +40,7 @@ Tracing for Windows）内核日志实时捕获文件打开/读写/关闭/改名/
   默认配置，不阻塞启动），UI 点"应用"时 `save()` 用 `*.tmp` + rename 原子写回。
   结构：`{ process_filter: {mode, keywords}, path_filter: {mode, keywords} }`，每个
   filter 的 mode 是 `off` / `whitelist` / `blacklist`，keywords 是字符串数组。
+  keywords 里含 glob 元字符的关键字会被当 glob 模式编译。
 - `src/etw.rs` —— ETW 内核追踪的核心逻辑：
   - 只需启用一个 `FILE_INIT_IO_PROVIDER`（对应 `EVENT_TRACE_FLAG_FILE_IO_INIT`），
     就同时覆盖 Create（真正的打开事件）、Read/Write、Cleanup/Close/Flush、
