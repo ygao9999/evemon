@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
+use raw_window_handle::HasWindowHandle;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use parking_lot::RwLock;

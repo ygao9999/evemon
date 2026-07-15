@@ -21,3 +21,4 @@ serde_json = "1"
 sysinfo = "0.39"
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 drag = "2.1.1"
+raw-window-handle = "0.6"
