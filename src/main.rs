@@ -16,8 +16,6 @@ use config::{AppConfig, FilterModeDto};
 use store::{EventStore, FileEvent, FilterConfig, PathFilterConfig};
 
 const MAX_DISPLAY_ROWS: i64 = 5000;
-/// 内存库同步到磁盘文件的频率——"以一定的频率写入硬盘"
-const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const DISK_DB_FILENAME: &str = "evemon_events.sqlite3";
 /// 过滤配置文件名。和 DISK_DB_FILENAME 同目录（程序当前工作目录）。
 const CONFIG_FILENAME: &str = "evemon_config.json";
@@ -74,13 +72,11 @@ struct EveMonApp {
     /// 当前选中的行索引（在 frozen_rows 里的下标）。None 表示没选中。
     /// 点表格行选中，Esc 取消选中。选中行高亮显示，底部详情面板显示完整路径。
     selected_row: Option<usize>,
+    flush_interval_secs: u64,
 }
 
 impl EveMonApp {
     fn new() -> anyhow::Result<Self> {
-        let disk_path = PathBuf::from(DISK_DB_FILENAME);
-        let store = EventStore::open(disk_path, FLUSH_INTERVAL)?;
-
         // 启动时读取配置文件（不存在则默认全 off）。
         // 读到的过滤配置立即同步到 ETW 回调共享的 FilterConfig / PathFilterConfig，
         // 同时初始化 UI 里的编辑状态，保证启动后界面显示和实际生效的过滤一致。
@@ -88,6 +84,15 @@ impl EveMonApp {
         let cfg = config::load(&config_path)?;
         let proc_filter = cfg.to_process_filter();
         let path_filter_cfg = cfg.to_path_filter();
+
+        let flush_interval = if cfg.flush_interval_secs == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(cfg.flush_interval_secs)
+        };
+
+        let disk_path = PathBuf::from(DISK_DB_FILENAME);
+        let store = EventStore::open(disk_path, flush_interval)?;
 
         let capture_filter: Arc<RwLock<FilterConfig>> =
             Arc::new(RwLock::new(proc_filter.clone()));
@@ -127,6 +132,7 @@ impl EveMonApp {
             path_filter_summary,
             config_path,
             selected_row: None,
+            flush_interval_secs: cfg.flush_interval_secs,
         })
     }
 
@@ -211,6 +217,7 @@ impl EveMonApp {
                 mode: FilterModeDto::from(self.path_filter_mode),
                 keywords: path_keywords,
             },
+            flush_interval_secs: self.flush_interval_secs,
         };
         if let Err(e) = config::save(&self.config_path, &app_cfg) {
             eprintln!("[config] 保存 {} 失败: {e}", self.config_path.display());
@@ -299,10 +306,15 @@ impl eframe::App for EveMonApp {
             } else {
                 ""
             };
+            let sync_status = if self.flush_interval_secs == 0 {
+                "自动同步已关闭".to_string()
+            } else {
+                format!("每 {} 秒自动同步", self.flush_interval_secs)
+            };
             ui.label(format!(
-                "内存库共 {} 条唯一路径 · 每 {} 秒自动同步到磁盘文件 {}{}",
+                "内存库共 {} 条唯一路径 · {} 到磁盘文件 {}{}",
                 self.total_count,
-                FLUSH_INTERVAL.as_secs(),
+                sync_status,
                 DISK_DB_FILENAME,
                 refresh_status
             ));
@@ -571,6 +583,15 @@ impl eframe::App for EveMonApp {
             if let Some(ev) = self.frozen_rows.get(idx) {
                 ctx.output_mut(|o| o.copied_text = ev.path.clone());
             }
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        println!("[EveMonApp] 正在退出，执行最终落盘...");
+        if let Err(e) = self.store.flush_to_disk() {
+            eprintln!("[EveMonApp] 退出时落盘失败: {e:?}");
+        } else {
+            println!("[EveMonApp] 退出时落盘成功");
         }
     }
 }

@@ -53,10 +53,26 @@ pub struct FilterConfigDto {
     pub keywords: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_flush_interval() -> u64 {
+    5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub process_filter: FilterConfigDto,
     pub path_filter: FilterConfigDto,
+    #[serde(default = "default_flush_interval")]
+    pub flush_interval_secs: u64,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            process_filter: FilterConfigDto::default(),
+            path_filter: FilterConfigDto::default(),
+            flush_interval_secs: default_flush_interval(),
+        }
+    }
 }
 
 impl AppConfig {

@@ -327,7 +327,7 @@ impl EventStore {
             activity_counter: AtomicI64::new(init_counter),
         });
 
-        {
+        if flush_interval > Duration::ZERO {
             let store = store.clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(flush_interval);
