@@ -136,11 +136,15 @@ impl EventStore {
         let mut mem_conn = Connection::open_in_memory()?;
 
         if disk_path.exists() {
-            // 先把磁盘库整体拷回内存，mem_conn 现在带着磁盘库的 schema + user_version + 数据
-            let disk_conn = Connection::open(&disk_path)?;
-            let backup = Backup::new(&disk_conn, &mut mem_conn)?;
-            backup.run_to_completion(100, Duration::from_millis(0), None)?;
-            drop(disk_conn);
+            // 先把磁盘库整体拷回内存，mem_conn 现在带着磁盘库的 schema + user_version + 数据。
+            // Backup::new 借走 mem_conn 的可变借用，必须放在独立作用域里，run_to_completion
+            // 完成后 backup 被 drop、可变借用才释放，后面才能继续用 mem_conn 做迁移检查。
+            {
+                let disk_conn = Connection::open(&disk_path)?;
+                let mut backup = Backup::new(&disk_conn, &mut mem_conn)?;
+                backup.run_to_completion(100, Duration::from_millis(0), None)?;
+                // backup + disk_conn 在这里 drop
+            }
 
             let version: i64 =
                 mem_conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
