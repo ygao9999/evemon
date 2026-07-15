@@ -501,20 +501,37 @@ impl eframe::App for EveMonApp {
                         let idx = row.index();
                         row.set_selected(selected == Some(idx));
                         let ev = &rows[idx];
-                        row.col(|ui| { ui.label(&ev.time_str); });
-                        row.col(|ui| { ui.label(ev.count.to_string()); });
-                        row.col(|ui| { ui.label(ev.pid.to_string()); });
-                        row.col(|ui| { ui.label(&ev.process_name); });
-                        row.col(|ui| { ui.label(&ev.operation); });
+                        let mut clicked = false;
                         row.col(|ui| {
-                            ui.add(
-                                egui::Label::new(&ev.path)
-                                    .truncate(),
-                            );
+                            let resp = ui.add(egui::Label::new(&ev.time_str).sense(egui::Sense::click()));
+                            if resp.clicked() || resp.is_pointer_button_down_on() { clicked = true; }
                         });
-                        row.col(|ui| { ui.label(&ev.detail); });
+                        row.col(|ui| {
+                            let resp = ui.add(egui::Label::new(ev.count.to_string()).sense(egui::Sense::click()));
+                            if resp.clicked() || resp.is_pointer_button_down_on() { clicked = true; }
+                        });
+                        row.col(|ui| {
+                            let resp = ui.add(egui::Label::new(ev.pid.to_string()).sense(egui::Sense::click()));
+                            if resp.clicked() || resp.is_pointer_button_down_on() { clicked = true; }
+                        });
+                        row.col(|ui| {
+                            let resp = ui.add(egui::Label::new(&ev.process_name).sense(egui::Sense::click()));
+                            if resp.clicked() || resp.is_pointer_button_down_on() { clicked = true; }
+                        });
+                        row.col(|ui| {
+                            let resp = ui.add(egui::Label::new(&ev.operation).sense(egui::Sense::click()));
+                            if resp.clicked() || resp.is_pointer_button_down_on() { clicked = true; }
+                        });
+                        row.col(|ui| {
+                            let resp = ui.add(egui::Label::new(&ev.path).truncate().sense(egui::Sense::click()));
+                            if resp.clicked() || resp.is_pointer_button_down_on() { clicked = true; }
+                        });
+                        row.col(|ui| {
+                            let resp = ui.add(egui::Label::new(&ev.detail).sense(egui::Sense::click()));
+                            if resp.clicked() || resp.is_pointer_button_down_on() { clicked = true; }
+                        });
                         let resp = row.response();
-                        if resp.clicked() || resp.is_pointer_button_down_on() {
+                        if clicked || resp.clicked() || resp.is_pointer_button_down_on() {
                             clicked_row = Some(idx);
                         }
                     });
