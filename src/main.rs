@@ -463,6 +463,7 @@ impl eframe::App for EveMonApp {
             let rows = &self.frozen_rows;
             egui_extras::TableBuilder::new(ui)
                 .striped(true)
+                .sense(egui::Sense::click())
                 .column(egui_extras::Column::auto().at_least(90.0))  // 最后访问时间
                 .column(egui_extras::Column::auto().at_least(60.0))  // 次数
                 .column(egui_extras::Column::auto().at_least(70.0))  // PID
@@ -484,21 +485,20 @@ impl eframe::App for EveMonApp {
                         let idx = row.index();
                         row.set_selected(selected == Some(idx));
                         let ev = &rows[idx];
-                        let mut clicked = false;
-                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.time_str); }).1.clicked();
-                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(ev.count.to_string()); }).1.clicked();
-                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(ev.pid.to_string()); }).1.clicked();
-                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.process_name); }).1.clicked();
-                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.operation); }).1.clicked();
-                        clicked |= row.col_sense(egui::Sense::click(), |ui| {
+                        row.col(|ui| { ui.label(&ev.time_str); });
+                        row.col(|ui| { ui.label(ev.count.to_string()); });
+                        row.col(|ui| { ui.label(ev.pid.to_string()); });
+                        row.col(|ui| { ui.label(&ev.process_name); });
+                        row.col(|ui| { ui.label(&ev.operation); });
+                        row.col(|ui| {
                             ui.add(
                                 egui::Label::new(&ev.path)
                                     .truncate(),
                             );
-                        }).1.clicked();
-                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.detail); }).1.clicked();
-
-                        if clicked {
+                        });
+                        row.col(|ui| { ui.label(&ev.detail); });
+                        let resp = row.response();
+                        if resp.clicked() {
                             clicked_row = Some(idx);
                         }
                     });
