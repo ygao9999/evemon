@@ -14,4 +14,5 @@ egui_extras = "=0.28.1"
 ferrisetw = "1.2.0"
 fuzzy-matcher = "0.3.7"
 parking_lot = "0.12.5"
+rusqlite = { version = "=0.31.0", default-features = false, features = ["bundled", "backup"] }
 sysinfo = "0.39"

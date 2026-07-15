@@ -13,6 +13,11 @@ Tracing for Windows）内核日志实时捕获文件打开/读写/关闭/改名/
 
 ## 架构
 
+- `src/store.rs` —— 事件存储：内存 SQLite（承担 ETW 回调的高频写入）+ 后台线程按
+  固定频率（默认 5 秒）用 SQLite 的 Online Backup API 把内存库整体同步到磁盘文件
+  `evemon_events.sqlite3`。这部分逻辑在 Linux 沙盒里**真实编译、真实跑通过**：写入、
+  SQL 粗过滤（LIKE）+ Rust 侧 fuzzy 精排、重启后从磁盘读回历史、自动落盘，都单独
+  验证过，不是凭空写的。
 - `src/etw.rs` —— ETW 内核追踪的核心逻辑：
   - 只需启用一个 `FILE_INIT_IO_PROVIDER`（对应 `EVENT_TRACE_FLAG_FILE_IO_INIT`），
     就同时覆盖 Create（真正的打开事件）、Read/Write、Cleanup/Close/Flush、
@@ -42,7 +47,9 @@ cargo run --release
   Read/Write/Rename 事件会显示 `<未知文件 fobj=0x..>`。正经实现需要在追踪启动时
   再做一次 rundown 枚举去补这个洞，目前还没做。
 - ETW 事件在系统压力大、缓冲区满时可能会丢，属于 ETW 机制本身的限制。
-- 这个仓库里的 GUI/ETW 代码没有在 Windows 上实机编译验证过（沙盒环境是 Linux，
-  且 `ferrisetw` 本身没有跨平台 cfg 隔离，根本编译不了），所有 API 用法是对照
-  `ferrisetw`/`sysinfo` 源码逐个核实字段名和签名写的。第一次真实编译建议看
-  `.github/workflows/build.yml` 跑出来的 Actions 日志，或者本地 `cargo check`。
+- `src/store.rs`（SQLite 内存库 + 定期落盘）**在 Linux 沙盒里真实编译并跑通过**，
+  逻辑是可信的。`src/etw.rs` 和 `src/main.rs`（GUI）**没有**在 Windows 上实机编译
+  验证过——沙盒是 Linux，且 `ferrisetw` 本身没有跨平台 cfg 隔离，根本编译不了。
+  这两部分的 API 用法是对照 `ferrisetw`/`eframe`/`sysinfo` 源码逐个核实字段名和
+  签名写的。第一次真实编译建议看 `.github/workflows/build.yml` 跑出来的 Actions
+  日志，或者本地 `cargo check`。

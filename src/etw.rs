@@ -1,5 +1,4 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -12,57 +11,11 @@ use ferrisetw::EventRecord;
 
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-/// 事件环形缓冲最多保留多少条，防止长时间运行内存无限增长
-pub const MAX_EVENTS: usize = 20_000;
+use crate::store::{EventStore, NewFileEvent};
 
 /// FileObject -> 路径 关联表如果因为漏掉 Close 事件一直增长，超过这个阈值就整体清空重来
 /// （粗暴但简单的安全阀，正经实现应该是 LRU）
 const MAX_FILEOBJ_MAP: usize = 100_000;
-
-#[derive(Clone, Debug)]
-pub struct FileEvent {
-    pub seq: u64,
-    pub time_str: String,
-    pub pid: u32,
-    pub process_name: String,
-    pub operation: String,
-    pub path: String,
-    /// 额外信息：读写的字节数/偏移量等，不是每种操作都有
-    pub detail: String,
-}
-
-/// 实时事件日志：ETW 回调线程写入，GUI 线程读取快照。
-pub struct EventLog {
-    events: RwLock<VecDeque<FileEvent>>,
-    seq: AtomicU64,
-}
-
-impl EventLog {
-    pub fn new() -> Self {
-        Self {
-            events: RwLock::new(VecDeque::with_capacity(MAX_EVENTS)),
-            seq: AtomicU64::new(0),
-        }
-    }
-
-    fn push(&self, mut ev: FileEvent) {
-        ev.seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let mut w = self.events.write();
-        if w.len() >= MAX_EVENTS {
-            w.pop_front();
-        }
-        w.push_back(ev);
-    }
-
-    pub fn len(&self) -> usize {
-        self.events.read().len()
-    }
-
-    /// 拷贝一份当前快照给 UI 过滤用，避免长期持锁阻塞 ETW 回调线程写入。
-    pub fn snapshot(&self) -> Vec<FileEvent> {
-        self.events.read().iter().cloned().collect()
-    }
-}
 
 /// FILETIME（自 1601-01-01 起的 100ns 间隔数）转成 HH:MM:SS.mmm 字符串
 fn filetime_to_string(filetime: i64) -> String {
@@ -84,7 +37,7 @@ fn resolve_process_name(proc_table: &Mutex<System>, pid: u32) -> String {
         .unwrap_or_else(|| format!("pid:{pid}"))
 }
 
-/// 启动 ETW 内核 FileIo 追踪，捕获文件打开/读写/关闭/改名/删除等事件。
+/// 启动 ETW 内核 FileIo 追踪，捕获文件打开/读写/关闭/改名/删除等事件，写入 SQLite 内存库。
 ///
 /// 背景（基于微软 FileIo 事件文档核实过字段名，不是凭印象猜的）：
 /// - 单个 `EVENT_TRACE_FLAG_FILE_IO_INIT` (对应 ferrisetw 的 `FILE_INIT_IO_PROVIDER`)
@@ -105,7 +58,7 @@ fn resolve_process_name(proc_table: &Mutex<System>, pid: u32) -> String {
 /// - FileObject -> 路径的映射是尽力而为的：如果文件在追踪启动前就已经打开了（没有
 ///   补做 rundown 枚举），或者 Close 事件丢失，对应的 Read/Write/Rename 就可能查不到
 ///   路径，界面上会显示 `<未知文件 fobj=0x..>`。
-pub fn spawn_etw_capture(log: Arc<EventLog>) -> anyhow::Result<KernelTrace> {
+pub fn spawn_etw_capture(store: Arc<EventStore>) -> anyhow::Result<KernelTrace> {
     let proc_table = Arc::new(Mutex::new(System::new()));
     let fileobj_to_path: Arc<RwLock<HashMap<usize, String>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -144,15 +97,17 @@ pub fn spawn_etw_capture(log: Arc<EventLog>) -> anyhow::Result<KernelTrace> {
                 }
                 map.insert(*fobj, path.clone());
             }
-            log.push(FileEvent {
-                seq: 0,
+            let ev = NewFileEvent {
                 time_str: filetime_to_string(record.raw_timestamp()),
                 pid,
                 process_name: resolve_process_name(&proc_table, pid),
                 operation: opcode,
                 path,
                 detail: String::new(),
-            });
+            };
+            if let Err(e) = store.insert(&ev) {
+                eprintln!("[etw] 写入事件失败: {e:?}");
+            }
             return;
         }
 
@@ -184,15 +139,17 @@ pub fn spawn_etw_capture(log: Arc<EventLog>) -> anyhow::Result<KernelTrace> {
             _ => String::new(),
         };
 
-        log.push(FileEvent {
-            seq: 0,
+        let ev = NewFileEvent {
             time_str: filetime_to_string(record.raw_timestamp()),
             pid,
             process_name: resolve_process_name(&proc_table, pid),
             operation: opcode,
             path,
             detail,
-        });
+        };
+        if let Err(e) = store.insert(&ev) {
+            eprintln!("[etw] 写入事件失败: {e:?}");
+        }
     };
 
     let provider = Provider::kernel(&kernel_providers::FILE_INIT_IO_PROVIDER)
