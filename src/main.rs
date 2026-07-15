@@ -127,6 +127,7 @@ impl EveMonApp {
 
         // 先用 SQL LIKE 做一次粗过滤缩小候选集，再用 fuzzy-matcher 精排，
         // 兼顾"库里几万条也查得快"和"排序看起来跟 Everything 一样顺眼"。
+        // hay 里带上 count，这样搜"47"这种数字也能命中被打开 47 次的路径。
         let candidates = self
             .store
             .search(&self.query, MAX_DISPLAY_ROWS)
@@ -134,7 +135,10 @@ impl EveMonApp {
         let mut scored: Vec<(i64, FileEvent)> = candidates
             .into_iter()
             .filter_map(|e| {
-                let hay = format!("{} {} {} {}", e.path, e.process_name, e.operation, e.detail);
+                let hay = format!(
+                    "{} {} {} {} {}",
+                    e.path, e.process_name, e.operation, e.detail, e.count
+                );
                 self.matcher
                     .fuzzy_match(&hay, &self.query)
                     .map(|s| (s, e))
@@ -176,7 +180,7 @@ impl eframe::App for EveMonApp {
             });
             ui.add_space(4.0);
             ui.label(format!(
-                "内存库共 {} 条事件 · 每 {} 秒自动同步到磁盘文件 {}{}",
+                "内存库共 {} 条唯一路径 · 每 {} 秒自动同步到磁盘文件 {}{}",
                 self.total_count,
                 FLUSH_INTERVAL.as_secs(),
                 DISK_DB_FILENAME,
@@ -235,15 +239,19 @@ impl eframe::App for EveMonApp {
             let rows = &self.frozen_rows;
             egui_extras::TableBuilder::new(ui)
                 .striped(true)
-                .column(egui_extras::Column::auto().at_least(90.0)) // 时间
-                .column(egui_extras::Column::auto().at_least(70.0)) // PID
+                .column(egui_extras::Column::auto().at_least(90.0))  // 最后访问时间
+                .column(egui_extras::Column::auto().at_least(60.0))  // 次数
+                .column(egui_extras::Column::auto().at_least(70.0))  // PID
                 .column(egui_extras::Column::auto().at_least(140.0)) // 进程名
-                .column(egui_extras::Column::auto().at_least(90.0)) // 操作
-                .column(egui_extras::Column::remainder()) // 路径
+                .column(egui_extras::Column::auto().at_least(90.0))  // 操作
+                .column(egui_extras::Column::remainder())            // 路径
                 .column(egui_extras::Column::auto().at_least(140.0)) // 详情
                 .header(20.0, |mut header| {
                     header.col(|ui| {
-                        ui.strong("时间");
+                        ui.strong("最后访问");
+                    });
+                    header.col(|ui| {
+                        ui.strong("次数");
                     });
                     header.col(|ui| {
                         ui.strong("PID");
@@ -266,6 +274,9 @@ impl eframe::App for EveMonApp {
                         let ev = &rows[row.index()];
                         row.col(|ui| {
                             ui.label(&ev.time_str);
+                        });
+                        row.col(|ui| {
+                            ui.label(ev.count.to_string());
                         });
                         row.col(|ui| {
                             ui.label(ev.pid.to_string());

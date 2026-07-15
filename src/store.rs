@@ -1,12 +1,18 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
 use rusqlite::{backup::Backup, params, Connection};
 
-/// 内存库里最多保留多少条事件（防止长时间运行内存无限增长）
+/// 内存库里最多保留多少条**唯一路径**（防止长时间运行内存无限增长）
 pub const MAX_ROWS: i64 = 20_000;
+
+/// schema 版本号——通过 PRAGMA user_version 持久化在 SQLite 库头里。
+/// v0：旧 schema（无 UNIQUE 约束，path 重复插入）
+/// v1：path UNIQUE + count + first_seen + last_activity 列
+const SCHEMA_VERSION: i64 = 1;
 
 /// 进程过滤配置——同时给 ETW 抓取层（决定哪些进程的事件入库）和 UI 显示层
 /// （按进程名二次过滤）使用。匹配规则是 case-insensitive 子串包含：
@@ -59,12 +65,19 @@ impl FilterConfig {
 #[derive(Debug, Clone)]
 pub struct FileEvent {
     pub seq: i64,
+    /// 最后一次活动对应的 last_activity 序号（单调递增，用于排序和裁剪）
+    pub last_activity: i64,
+    /// 最后一次看到该路径的时间字符串
     pub time_str: String,
     pub pid: u32,
     pub process_name: String,
     pub operation: String,
     pub path: String,
     pub detail: String,
+    /// 该路径累计被命中的次数
+    pub count: i64,
+    /// 首次看到该路径的时间字符串
+    pub first_seen: String,
 }
 
 /// 插入时不需要 seq（由 SQLite 自增），单独给一个结构体避免和查询返回的 FileEvent 混淆
@@ -77,17 +90,27 @@ pub struct NewFileEvent {
     pub detail: String,
 }
 
+/// schema 定义。和旧 schema 的关键差异：
+/// - `path` 加 UNIQUE 约束——同一个路径在表里只允许一行
+/// - 新增 `count` 列记录命中次数（首次插入 = 1，后续命中 +1）
+/// - 新增 `first_seen` 列保留首次看到的时间（不被 ON CONFLICT 覆盖）
+/// - 新增 `last_activity` 列——单调递增的活动序号，用于"最近活跃"排序和裁剪。
+///   不能直接用 `seq`，因为 ON CONFLICT UPDATE 不会改 PRIMARY KEY AUTOINCREMENT。
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS file_events (
-    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
-    time_str     TEXT NOT NULL,
-    pid          INTEGER NOT NULL,
-    process_name TEXT NOT NULL,
-    operation    TEXT NOT NULL,
-    path         TEXT NOT NULL,
-    detail       TEXT NOT NULL
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    last_activity INTEGER NOT NULL,
+    time_str      TEXT NOT NULL,
+    pid           INTEGER NOT NULL,
+    process_name  TEXT NOT NULL,
+    operation     TEXT NOT NULL,
+    path          TEXT NOT NULL UNIQUE,
+    detail        TEXT NOT NULL,
+    count         INTEGER NOT NULL DEFAULT 1,
+    first_seen    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_file_events_path ON file_events(path);
+CREATE INDEX IF NOT EXISTS idx_file_events_last_activity ON file_events(last_activity);
 ";
 
 /// 内存 SQLite（承担 ETW 回调的高频写入） + 后台线程定期用 SQLite 的
@@ -96,29 +119,62 @@ CREATE INDEX IF NOT EXISTS idx_file_events_path ON file_events(path);
 pub struct EventStore {
     mem: Mutex<Connection>,
     disk_path: PathBuf,
+    /// 单调递增的活动序号。每次 insert 调用 fetch_add(1)，作为 last_activity 写入。
+    /// 启动时从 MAX(last_activity)+1 开始，保证跨重启的排序正确。
+    activity_counter: AtomicI64,
 }
 
 impl EventStore {
     /// 打开（或新建）磁盘库：如果磁盘上已经有上次运行留下的历史数据，先整体拷回内存库，
     /// 这样重启后界面上还能看到之前的记录；然后启动后台定期落盘线程。
+    ///
+    /// schema 迁移：通过 PRAGMA user_version 检测旧库。旧版（v0）的表没有 UNIQUE(path)
+    /// 约束、没有 count/first_seen/last_activity 列，里面已经累积了重复路径——这种库
+    /// 直接 DROP TABLE 重建，旧数据丢弃（ETW 事件本来就是临时的，丢一次历史可接受）。
+    /// 第一次落盘后磁盘库会被覆盖成新 schema + user_version=1，后续重启不再迁移。
     pub fn open(disk_path: PathBuf, flush_interval: Duration) -> anyhow::Result<Arc<Self>> {
         let mut mem_conn = Connection::open_in_memory()?;
-        mem_conn.execute_batch(SCHEMA)?;
 
         if disk_path.exists() {
+            // 先把磁盘库整体拷回内存，mem_conn 现在带着磁盘库的 schema + user_version + 数据
             let disk_conn = Connection::open(&disk_path)?;
-            // 反向操作：从磁盘 -> 内存
             let backup = Backup::new(&disk_conn, &mut mem_conn)?;
             backup.run_to_completion(100, Duration::from_millis(0), None)?;
+            drop(disk_conn);
+
+            let version: i64 =
+                mem_conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version < SCHEMA_VERSION {
+                eprintln!(
+                    "[EventStore] 旧 schema (user_version={version})，DROP TABLE 重建为 v{SCHEMA_VERSION}，旧数据丢弃"
+                );
+                mem_conn.execute("DROP TABLE IF EXISTS file_events", [])?;
+                mem_conn.execute_batch(SCHEMA)?;
+                mem_conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+            } else {
+                // 已经是新 schema，CREATE TABLE IF NOT EXISTS 是 no-op，幂等
+                mem_conn.execute_batch(SCHEMA)?;
+            }
         } else {
-            // 磁盘文件不存在也要建好并写入 schema，保证第一次落盘时文件是有效的 SQLite 库
+            // 磁盘文件不存在：内存库建新 schema，磁盘也建一份保证第一次落盘时文件有效
+            mem_conn.execute_batch(SCHEMA)?;
+            mem_conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
             let disk_conn = Connection::open(&disk_path)?;
             disk_conn.execute_batch(SCHEMA)?;
+            disk_conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         }
+
+        // activity_counter 从 MAX(last_activity)+1 起步，保证跨重启 last_activity 仍然单调
+        let init_counter: i64 = mem_conn.query_row(
+            "SELECT COALESCE(MAX(last_activity), 0) + 1 FROM file_events",
+            [],
+            |r| r.get(0),
+        )?;
 
         let store = Arc::new(Self {
             mem: Mutex::new(mem_conn),
             disk_path,
+            activity_counter: AtomicI64::new(init_counter),
         });
 
         {
@@ -134,12 +190,31 @@ impl EventStore {
         Ok(store)
     }
 
+    /// 插入一条事件。同一个 path 在表里只允许一行——重复路径触发的 ON CONFLICT
+    /// 会把 count + 1，并更新 last_activity / time_str / pid / process_name /
+    /// operation / detail 到本次最新的值。first_seen 在首次插入时定下来，之后不变。
+    ///
+    /// 裁剪用 last_activity 而不是 seq：seq 在 ON CONFLICT UPDATE 时不会变化（PRIMARY
+    /// KEY AUTOINCREMENT 不被 ON CONFLICT 改写），如果按 seq 裁剪会把"很早插入但
+    /// 最近还在被访问"的热点路径误删。last_activity 是 Rust 侧用 AtomicI64 维护的
+    /// 单调计数器，每次插入都 fetch_add，反映真实最近活跃度。
     pub fn insert(&self, ev: &NewFileEvent) -> anyhow::Result<()> {
+        let activity = self.activity_counter.fetch_add(1, Ordering::Relaxed);
         let conn = self.mem.lock();
         conn.execute(
-            "INSERT INTO file_events (time_str, pid, process_name, operation, path, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO file_events
+                (last_activity, time_str, pid, process_name, operation, path, detail, count, first_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?2)
+             ON CONFLICT(path) DO UPDATE SET
+                last_activity = excluded.last_activity,
+                time_str      = excluded.time_str,
+                pid           = excluded.pid,
+                process_name  = excluded.process_name,
+                operation     = excluded.operation,
+                detail        = excluded.detail,
+                count         = file_events.count + 1",
             params![
+                activity,
                 ev.time_str,
                 ev.pid,
                 ev.process_name,
@@ -149,21 +224,22 @@ impl EventStore {
             ],
         )?;
 
-        // 简单粗暴的裁剪：每次插入顺手删一次超出上限的老记录。
+        // 简单粗暴的裁剪：每次插入顺手删一次超出上限的老记录（按 last_activity 排）。
         // 在内存库里做这个非常快，量级到万级别没有可感知的开销。
         conn.execute(
-            "DELETE FROM file_events WHERE seq <= (SELECT COALESCE(MAX(seq), 0) FROM file_events) - ?1",
+            "DELETE FROM file_events
+             WHERE last_activity <= (SELECT COALESCE(MAX(last_activity), 0) FROM file_events) - ?1",
             params![MAX_ROWS],
         )?;
         Ok(())
     }
 
-    /// 最近 N 条，按时间倒序（最新的在最前面）
+    /// 最近 N 条，按最后活跃时间倒序（最近被访问的路径在最前面）
     pub fn recent(&self, limit: i64) -> anyhow::Result<Vec<FileEvent>> {
         let conn = self.mem.lock();
         let mut stmt = conn.prepare(
-            "SELECT seq, time_str, pid, process_name, operation, path, detail
-             FROM file_events ORDER BY seq DESC LIMIT ?1",
+            "SELECT seq, last_activity, time_str, pid, process_name, operation, path, detail, count, first_seen
+             FROM file_events ORDER BY last_activity DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], row_to_event)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -175,12 +251,12 @@ impl EventStore {
         let pattern = format!("%{}%", keyword.replace('%', "\\%").replace('_', "\\_"));
         let conn = self.mem.lock();
         let mut stmt = conn.prepare(
-            "SELECT seq, time_str, pid, process_name, operation, path, detail
+            "SELECT seq, last_activity, time_str, pid, process_name, operation, path, detail, count, first_seen
              FROM file_events
              WHERE path LIKE ?1 ESCAPE '\\'
                 OR process_name LIKE ?1 ESCAPE '\\'
                 OR operation LIKE ?1 ESCAPE '\\'
-             ORDER BY seq DESC LIMIT ?2",
+             ORDER BY last_activity DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![pattern, limit], row_to_event)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -204,11 +280,14 @@ impl EventStore {
 fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<FileEvent> {
     Ok(FileEvent {
         seq: row.get(0)?,
-        time_str: row.get(1)?,
-        pid: row.get(2)?,
-        process_name: row.get(3)?,
-        operation: row.get(4)?,
-        path: row.get(5)?,
-        detail: row.get(6)?,
+        last_activity: row.get(1)?,
+        time_str: row.get(2)?,
+        pid: row.get(3)?,
+        process_name: row.get(4)?,
+        operation: row.get(5)?,
+        path: row.get(6)?,
+        detail: row.get(7)?,
+        count: row.get(8)?,
+        first_seen: row.get(9)?,
     })
 }

@@ -19,6 +19,14 @@ Tracing for Windows）内核日志实时捕获文件打开/读写/关闭/改名/
   SQL 粗过滤（LIKE）+ Rust 侧 fuzzy 精排、重启后从磁盘读回历史、自动落盘，都单独
   验证过，不是凭空写的。本文件还定义了 `FilterConfig`（白/黑名单 + case-insensitive
   子串匹配），同时供 ETW 抓取层和 UI 显示层复用。
+  - **路径去重**：表里 `path` 是 UNIQUE 的，同一个路径只允许一行。重复打开同一个
+    文件触发的 `ON CONFLICT(path) DO UPDATE` 只累加 `count`、把 `last_activity` /
+    `time_str` / `pid` / `process_name` / `operation` / `detail` 更新为本次最新的值，
+    `first_seen` 保留首次见到的时间不变。表多了一列 `count` 显示该路径累计被命中的
+    次数，排序按 `last_activity DESC`（最近活跃的路径在最前面）。
+  - schema 版本用 `PRAGMA user_version` 持久化。检测到旧版（无 UNIQUE 约束、无
+    `count`/`first_seen`/`last_activity` 列）会 `DROP TABLE` 重建，旧数据丢弃
+    （ETW 事件本来就是临时的，丢一次历史可接受）。
 - `src/etw.rs` —— ETW 内核追踪的核心逻辑：
   - 只需启用一个 `FILE_INIT_IO_PROVIDER`（对应 `EVENT_TRACE_FLAG_FILE_IO_INIT`），
     就同时覆盖 Create（真正的打开事件）、Read/Write、Cleanup/Close/Flush、
