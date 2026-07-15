@@ -409,7 +409,7 @@ impl eframe::App for EveMonApp {
                         ui.strong("路径:");
                         ui.add(
                             egui::Label::new(&ev.path)
-                                .wrap(true)
+                                .wrap()
                                 .selectable(true),
                         );
                     });
@@ -421,7 +421,7 @@ impl eframe::App for EveMonApp {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("📋 复制路径").clicked() {
-                            ui.output_mut(|o| o.copied_text = ev.path.clone().into());
+                            ui.output_mut(|o| o.copied_text = ev.path.clone());
                         }
                         if ui.button("取消选中 (Esc)").clicked() {
                             self.selected_row = None;
