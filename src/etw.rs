@@ -13,7 +13,7 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use windows_sys::Win32::Storage::FileSystem::{GetLogicalDriveStringsW, QueryDosDeviceW};
 
-use crate::store::{EventStore, FilterConfig, NewFileEvent};
+use crate::store::{EventStore, FilterConfig, NewFileEvent, PathFilterConfig};
 
 /// FileObject -> 路径 关联表如果因为漏掉 Close 事件一直增长，超过这个阈值就整体清空重来
 /// （粗暴但简单的安全阀，正经实现应该是 LRU）
@@ -146,6 +146,7 @@ fn translate_nt_path(nt_path: &str, map: &HashMap<String, String>) -> String {
 pub fn spawn_etw_capture(
     store: Arc<EventStore>,
     capture_filter: Arc<RwLock<FilterConfig>>,
+    path_filter: Arc<RwLock<PathFilterConfig>>,
 ) -> anyhow::Result<KernelTrace> {
     let proc_table = Arc::new(Mutex::new(System::new()));
     let fileobj_to_path: Arc<RwLock<HashMap<usize, String>>> =
@@ -201,6 +202,11 @@ pub fn spawn_etw_capture(
             };
             // 把 \Device\HarddiskVolume9\... 翻译成 C:\...
             let path = translate_nt_path(&raw_path, &device_to_drive.read());
+            // 路径过滤（白/黑名单），命中的直接丢，连 FileObject 映射表都不更新。
+            // 这样后续 Read/Write/Close 反查会拿到 fallback 字符串，下面那段会再判一次。
+            if !path_filter.read().allows(&path) {
+                return;
+            }
             if let Ok(fobj) = parser.try_parse::<Pointer>("FileObject") {
                 let mut map = fileobj_to_path.write();
                 if map.len() > MAX_FILEOBJ_MAP {
@@ -231,12 +237,32 @@ pub fn spawn_etw_capture(
             Err(_) => return,
         };
 
+        // 反查失败说明文件在 trace 启动前就打开了（没做 rundown）或者 Close 事件丢过。
+        // 路径未知，没法做路径过滤，索性不入库——以前会把 "<未知文件 fobj=0x..>" 当 path
+        // 写进去，既没法过滤也占行数。
         let path = {
             let map = fileobj_to_path.read();
-            map.get(&fobj)
-                .cloned()
-                .unwrap_or_else(|| format!("<未知文件 fobj=0x{fobj:x}>"))
+            match map.get(&fobj) {
+                Some(p) => p.clone(),
+                None => {
+                    // Close 之后这个 FileObject 就失效了，及时清理，避免映射表无限增长。
+                    // 即使反查失败也试着 remove 一下（close 时 FileObject 必然已经在表里
+                    // 或者已经被清掉，这里 remove 是 no-op 也无所谓）。
+                    if opcode == "Close" {
+                        drop(map);
+                        fileobj_to_path.write().remove(&fobj);
+                    }
+                    return;
+                }
+            }
         };
+
+        // 路径过滤——和 Create 走同一份 PathFilterConfig，所以 Create 阶段被过滤掉的
+        // 文件，这里理论上反查也拿不到（没进映射表，前面就 return 了）。但保险起见还是
+        // 查一次：用户可能在 Create 之后才改了 path_filter 配置。
+        if !path_filter.read().allows(&path) {
+            return;
+        }
 
         // Close 之后这个 FileObject 就失效了，及时清理，避免映射表无限增长
         if opcode == "Close" {

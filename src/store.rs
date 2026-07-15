@@ -62,6 +62,52 @@ impl FilterConfig {
     }
 }
 
+/// 路径过滤配置——语义和 FilterConfig 完全对称，只是作用于 ETW 事件里的 path
+/// 字段。匹配规则是 case-insensitive 子串包含，所以 `D:\work_flow` 会同时命中
+/// `D:\work_flow\xxx` 和 `d:\WORK_FLOW\YYY`。
+///
+/// 路径过滤在 NT 路径翻译完成之后才做，所以关键字写 Win32 路径就行
+/// （`C:\Windows` 而不是 `\Device\HarddiskVolume9\Windows`）。
+#[derive(Debug, Clone, Default)]
+pub struct PathFilterConfig {
+    pub whitelist: Vec<String>,
+    pub blacklist: Vec<String>,
+}
+
+impl PathFilterConfig {
+    pub fn is_empty(&self) -> bool {
+        self.whitelist.is_empty() && self.blacklist.is_empty()
+    }
+
+    /// 判断给定路径是否应该被记录/显示。
+    /// 返回 false 表示该路径被过滤掉。
+    pub fn allows(&self, path: &str) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        let p = path.to_lowercase();
+        if !self.whitelist.is_empty() {
+            let hit = self
+                .whitelist
+                .iter()
+                .any(|kw| !kw.trim().is_empty() && p.contains(&kw.to_lowercase()));
+            if !hit {
+                return false;
+            }
+        }
+        if !self.blacklist.is_empty() {
+            let hit = self
+                .blacklist
+                .iter()
+                .any(|kw| !kw.trim().is_empty() && p.contains(&kw.to_lowercase()));
+            if hit {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct FileEvent {

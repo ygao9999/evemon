@@ -17,8 +17,9 @@ Tracing for Windows）内核日志实时捕获文件打开/读写/关闭/改名/
   固定频率（默认 5 秒）用 SQLite 的 Online Backup API 把内存库整体同步到磁盘文件
   `evemon_events.sqlite3`。这部分逻辑在 Linux 沙盒里**真实编译、真实跑通过**：写入、
   SQL 粗过滤（LIKE）+ Rust 侧 fuzzy 精排、重启后从磁盘读回历史、自动落盘，都单独
-  验证过，不是凭空写的。本文件还定义了 `FilterConfig`（白/黑名单 + case-insensitive
-  子串匹配），同时供 ETW 抓取层和 UI 显示层复用。
+  验证过，不是凭空写的。本文件还定义了 `FilterConfig`（进程过滤）和
+  `PathFilterConfig`（路径过滤），都是白/黑名单 + case-insensitive 子串匹配，
+  同时供 ETW 抓取层和 UI 显示层复用。
   - **路径去重**：表里 `path` 是 UNIQUE 的，同一个路径只允许一行。重复打开同一个
     文件触发的 `ON CONFLICT(path) DO UPDATE` 只累加 `count`、把 `last_activity` /
     `time_str` / `pid` / `process_name` / `operation` / `detail` 更新为本次最新的值，
@@ -27,6 +28,11 @@ Tracing for Windows）内核日志实时捕获文件打开/读写/关闭/改名/
   - schema 版本用 `PRAGMA user_version` 持久化。检测到旧版（无 UNIQUE 约束、无
     `count`/`first_seen`/`last_activity` 列）会 `DROP TABLE` 重建，旧数据丢弃
     （ETW 事件本来就是临时的，丢一次历史可接受）。
+- `src/config.rs` —— 过滤配置的持久化。JSON 格式，文件名 `evemon_config.json`，
+  和 `evemon_events.sqlite3` 同目录。启动时 `load()` 读取（不存在或解析失败则用
+  默认配置，不阻塞启动），UI 点"应用"时 `save()` 用 `*.tmp` + rename 原子写回。
+  结构：`{ process_filter: {mode, keywords}, path_filter: {mode, keywords} }`，每个
+  filter 的 mode 是 `off` / `whitelist` / `blacklist`，keywords 是字符串数组。
 - `src/etw.rs` —— ETW 内核追踪的核心逻辑：
   - 只需启用一个 `FILE_INIT_IO_PROVIDER`（对应 `EVENT_TRACE_FLAG_FILE_IO_INIT`），
     就同时覆盖 Create（真正的打开事件）、Read/Write、Cleanup/Close/Flush、
@@ -37,6 +43,11 @@ Tracing for Windows）内核日志实时捕获文件打开/读写/关闭/改名/
   - 用 `sysinfo` 定期刷新进程表，把事件里的 pid 翻译成进程名。
   - 回调拿到进程名后立即查 `Arc<RwLock<FilterConfig>>`，命中的进程直接 return，
     不走 FileObject 映射表也不写库，省内存也省 SQLite 写入压力。
+  - 路径过滤 `Arc<RwLock<PathFilterConfig>>`：Create 事件在 NT 路径翻译完成之后查一次，
+    命中的直接 return 不入库；Read/Write/Close 反查 FileObject 拿到 Win32 路径后再查一次
+    （保险，用户可能在 Create 之后才改了 path_filter）。反查失败的 FileObject（trace
+    启动前就打开的文件、丢失的 Close 事件）直接 return，不再把 `<未知文件 fobj=0x..>`
+    这种占位字符串写进库。
   - ETW 给的 `OpenPath` 是 NT 内核路径（`\Device\HarddiskVolume9\...`），回调里
     用 `GetLogicalDriveStringsW` + `QueryDosDeviceW` 建立的反向映射表把它翻译成
     Win32 路径（`C:\...`）。映射表启动时建一次，后台每 60 秒刷新一次（应对 U 盘

@@ -1,3 +1,4 @@
+mod config;
 mod etw;
 mod store;
 
@@ -10,12 +11,15 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use parking_lot::RwLock;
 
-use store::{EventStore, FileEvent, FilterConfig};
+use config::{AppConfig, FilterModeDto};
+use store::{EventStore, FileEvent, FilterConfig, PathFilterConfig};
 
 const MAX_DISPLAY_ROWS: i64 = 5000;
 /// 内存库同步到磁盘文件的频率——"以一定的频率写入硬盘"
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const DISK_DB_FILENAME: &str = "evemon_events.sqlite3";
+/// 过滤配置文件名。和 DISK_DB_FILENAME 同目录（程序当前工作目录）。
+const CONFIG_FILENAME: &str = "evemon_config.json";
 
 /// 抓取层过滤的模式：白名单只放行命中的进程，黑名单排除命中的进程。
 /// 关闭 = 两个列表都清空，等价于不过滤。
@@ -45,23 +49,61 @@ struct EveMonApp {
     frozen_rows: Vec<FileEvent>,
     total_count: i64,
 
-    /// ETW 抓取层共享的过滤配置——回调里读这个决定是否入库
+    /// ETW 抓取层共享的进程过滤配置——回调里读这个决定是否入库
     capture_filter: Arc<RwLock<FilterConfig>>,
-    /// UI 里编辑中的过滤模式（点"应用"才同步到 capture_filter）
+    /// UI 里编辑中的进程过滤模式（点"应用"才同步到 capture_filter）
     filter_mode: FilterMode,
-    /// UI 里编辑中的关键字文本（每行一个进程名片段）
+    /// UI 里编辑中的进程过滤关键字文本（每行一个进程名片段）
     filter_text: String,
-    /// 上一次"应用"后的过滤摘要，给状态栏显示用
+    /// 上一次"应用"后的进程过滤摘要，给状态栏显示用
     filter_summary: String,
+
+    /// ETW 抓取层共享的路径过滤配置——回调里 NT 翻译后读这个决定是否入库
+    path_filter: Arc<RwLock<PathFilterConfig>>,
+    /// UI 里编辑中的路径过滤模式
+    path_filter_mode: FilterMode,
+    /// UI 里编辑中的路径过滤关键字文本（每行一个路径片段）
+    path_filter_text: String,
+    /// 上一次"应用"后的路径过滤摘要
+    path_filter_summary: String,
+
+    /// 配置文件路径，点"应用"时把进程 + 路径过滤都写回这个文件
+    config_path: PathBuf,
 }
 
 impl EveMonApp {
     fn new() -> anyhow::Result<Self> {
         let disk_path = PathBuf::from(DISK_DB_FILENAME);
         let store = EventStore::open(disk_path, FLUSH_INTERVAL)?;
+
+        // 启动时读取配置文件（不存在则默认全 off）。
+        // 读到的过滤配置立即同步到 ETW 回调共享的 FilterConfig / PathFilterConfig，
+        // 同时初始化 UI 里的编辑状态，保证启动后界面显示和实际生效的过滤一致。
+        let config_path = PathBuf::from(CONFIG_FILENAME);
+        let cfg = config::load(&config_path)?;
+        let proc_filter = cfg.to_process_filter();
+        let path_filter_cfg = cfg.to_path_filter();
+
         let capture_filter: Arc<RwLock<FilterConfig>> =
-            Arc::new(RwLock::new(FilterConfig::default()));
-        let trace = etw::spawn_etw_capture(store.clone(), capture_filter.clone())?;
+            Arc::new(RwLock::new(proc_filter.clone()));
+        let path_filter: Arc<RwLock<PathFilterConfig>> =
+            Arc::new(RwLock::new(path_filter_cfg.clone()));
+        let trace = etw::spawn_etw_capture(
+            store.clone(),
+            capture_filter.clone(),
+            path_filter.clone(),
+        )?;
+
+        // 把配置文件里的模式 + keywords 同步到 UI 编辑状态
+        let (filter_mode, filter_text, filter_summary) = dto_to_ui_state(
+            cfg.process_filter.mode,
+            &cfg.process_filter.keywords,
+        );
+        let (path_filter_mode, path_filter_text, path_filter_summary) = dto_to_ui_state(
+            cfg.path_filter.mode,
+            &cfg.path_filter.keywords,
+        );
+
         Ok(Self {
             store,
             _trace: trace,
@@ -71,44 +113,102 @@ impl EveMonApp {
             frozen_rows: Vec::new(),
             total_count: 0,
             capture_filter,
-            filter_mode: FilterMode::Off,
-            filter_text: String::new(),
-            filter_summary: "未启用".to_string(),
+            filter_mode,
+            filter_text,
+            filter_summary,
+            path_filter,
+            path_filter_mode,
+            path_filter_text,
+            path_filter_summary,
+            config_path,
         })
     }
 
-    /// 把 UI 里编辑中的过滤设置同步到 ETW 回调共享的 FilterConfig。
+    /// 把 UI 里编辑中的进程过滤设置同步到 ETW 回调共享的 FilterConfig，
+    /// 同时把路径过滤也一起同步，最后把完整 AppConfig 写回文件。
     /// 空行和首尾空白会被忽略；模式为 Off 时清空两个列表。
-    fn apply_capture_filter(&mut self) {
-        let keywords: Vec<String> = self
+    fn apply_filters_and_save(&mut self) {
+        // 进程过滤
+        let proc_keywords: Vec<String> = self
             .filter_text
             .lines()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        let mut cfg = self.capture_filter.write();
-        cfg.whitelist.clear();
-        cfg.blacklist.clear();
-        match self.filter_mode {
-            FilterMode::Off => {
-                self.filter_summary = "未启用".to_string();
+        {
+            let mut cfg = self.capture_filter.write();
+            cfg.whitelist.clear();
+            cfg.blacklist.clear();
+            match self.filter_mode {
+                FilterMode::Off => {
+                    self.filter_summary = "未启用".to_string();
+                }
+                FilterMode::Whitelist => {
+                    cfg.whitelist = proc_keywords.clone();
+                    self.filter_summary = if proc_keywords.is_empty() {
+                        "白名单(空) → 实际不过滤".to_string()
+                    } else {
+                        format!("白名单: {} 个关键字", proc_keywords.len())
+                    };
+                }
+                FilterMode::Blacklist => {
+                    cfg.blacklist = proc_keywords.clone();
+                    self.filter_summary = if proc_keywords.is_empty() {
+                        "黑名单(空) → 实际不过滤".to_string()
+                    } else {
+                        format!("黑名单: {} 个关键字", proc_keywords.len())
+                    };
+                }
             }
-            FilterMode::Whitelist => {
-                cfg.whitelist = keywords.clone();
-                self.filter_summary = if keywords.is_empty() {
-                    "白名单(空) → 实际不过滤".to_string()
-                } else {
-                    format!("白名单: {} 个关键字", keywords.len())
-                };
+        }
+
+        // 路径过滤
+        let path_keywords: Vec<String> = self
+            .path_filter_text
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        {
+            let mut cfg = self.path_filter.write();
+            cfg.whitelist.clear();
+            cfg.blacklist.clear();
+            match self.path_filter_mode {
+                FilterMode::Off => {
+                    self.path_filter_summary = "未启用".to_string();
+                }
+                FilterMode::Whitelist => {
+                    cfg.whitelist = path_keywords.clone();
+                    self.path_filter_summary = if path_keywords.is_empty() {
+                        "白名单(空) → 实际不过滤".to_string()
+                    } else {
+                        format!("白名单: {} 个关键字", path_keywords.len())
+                    };
+                }
+                FilterMode::Blacklist => {
+                    cfg.blacklist = path_keywords.clone();
+                    self.path_filter_summary = if path_keywords.is_empty() {
+                        "黑名单(空) → 实际不过滤".to_string()
+                    } else {
+                        format!("黑名单: {} 个关键字", path_keywords.len())
+                    };
+                }
             }
-            FilterMode::Blacklist => {
-                cfg.blacklist = keywords.clone();
-                self.filter_summary = if keywords.is_empty() {
-                    "黑名单(空) → 实际不过滤".to_string()
-                } else {
-                    format!("黑名单: {} 个关键字", keywords.len())
-                };
-            }
+        }
+
+        // 持久化。save 失败不阻塞 UI，只打 stderr 提示用户。
+        let app_cfg = AppConfig {
+            process_filter: config::FilterConfigDto {
+                mode: FilterModeDto::from(self.filter_mode),
+                keywords: proc_keywords,
+            },
+            path_filter: config::FilterConfigDto {
+                mode: FilterModeDto::from(self.path_filter_mode),
+                keywords: path_keywords,
+            },
+        };
+        if let Err(e) = config::save(&self.config_path, &app_cfg) {
+            eprintln!("[config] 保存 {} 失败: {e}", self.config_path.display());
         }
     }
 
@@ -189,7 +289,7 @@ impl eframe::App for EveMonApp {
             ui.add_space(6.0);
         });
 
-        // 抓取层过滤面板（可折叠），收起时只占一行标题
+        // 抓取层进程过滤面板（可折叠），收起时只占一行标题
         egui::TopBottomPanel::top("capture_filter").show(ctx, |ui| {
             egui::CollapsingHeader::new(format!("🖥  抓取层进程过滤 [{}]", self.filter_summary))
                 .default_open(false)
@@ -209,23 +309,59 @@ impl eframe::App for EveMonApp {
                             .desired_rows(4)
                             .code_editor(),
                     );
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("✓ 应用过滤").clicked() {
-                            self.apply_capture_filter();
-                            filter_applied = true;
-                        }
-                        if ui.button("清空").clicked() {
-                            self.filter_text.clear();
-                            self.filter_mode = FilterMode::Off;
-                            self.apply_capture_filter();
-                            filter_applied = true;
-                        }
-                        ui.add_space(8.0);
-                        ui.label(format!("当前生效: {}", self.filter_summary));
-                    });
-                    ui.add_space(4.0);
                 });
+        });
+
+        // 路径过滤面板（可折叠）
+        egui::TopBottomPanel::top("path_filter").show(ctx, |ui| {
+            egui::CollapsingHeader::new(format!("📁  抓取层路径过滤 [{}]", self.path_filter_summary))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("模式:");
+                        for mode in [FilterMode::Off, FilterMode::Whitelist, FilterMode::Blacklist] {
+                            ui.radio_value(&mut self.path_filter_mode, mode, mode.label());
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ui.label("每行一个路径片段（case-insensitive 子串匹配，如 D:\\work_flow 匹配 D:\\work_flow\\拦截activity\\...）:");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.path_filter_text)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(4)
+                            .code_editor(),
+                    );
+                });
+        });
+
+        // 应用按钮独占一个小面板，避免两个折叠面板各自点"应用"都要重复同步
+        egui::TopBottomPanel::top("filter_actions").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                if ui.button("✓ 应用过滤并保存配置").clicked() {
+                    self.apply_filters_and_save();
+                    filter_applied = true;
+                }
+                if ui.button("清空进程过滤").clicked() {
+                    self.filter_text.clear();
+                    self.filter_mode = FilterMode::Off;
+                    self.apply_filters_and_save();
+                    filter_applied = true;
+                }
+                if ui.button("清空路径过滤").clicked() {
+                    self.path_filter_text.clear();
+                    self.path_filter_mode = FilterMode::Off;
+                    self.apply_filters_and_save();
+                    filter_applied = true;
+                }
+                ui.add_space(12.0);
+                ui.label(format!(
+                    "进程[{}] · 路径[{}] · 配置文件: {}",
+                    self.filter_summary, self.path_filter_summary, CONFIG_FILENAME
+                ));
+            });
+            ui.add_space(2.0);
         });
 
         // 不在暂停状态时，每帧都重新查询一次（下拉/输入变化，或者纯粹是新事件写入后自动刷新）
@@ -314,11 +450,53 @@ fn main() -> eframe::Result<()> {
             // "搜索"/"暂停"/"应用过滤" 等所有中文标签全部看不见。
             load_cjk_fonts(&cc.egui_ctx);
             let app = EveMonApp::new().expect(
-                "启动失败：请确认以管理员身份运行 ETW 追踪，且当前目录可写（用于 SQLite 落盘文件）",
+                "启动失败：请确认以管理员身份运行 ETW 追踪，且当前目录可写（用于 SQLite 落盘文件 + 配置文件）",
             );
             Ok(Box::new(app))
         }),
     )
+}
+
+/// 把配置文件里读出的 FilterModeDto + keywords 转成 UI 用的编辑状态：
+/// (FilterMode 枚举, 多行文本, 摘要)。多行文本是 keywords 用 \n 拼起来。
+fn dto_to_ui_state(
+    mode: FilterModeDto,
+    keywords: &[String],
+) -> (FilterMode, String, String) {
+    let ui_mode = match mode {
+        FilterModeDto::Off => FilterMode::Off,
+        FilterModeDto::Whitelist => FilterMode::Whitelist,
+        FilterModeDto::Blacklist => FilterMode::Blacklist,
+    };
+    let text = keywords.join("\n");
+    let summary = match mode {
+        FilterModeDto::Off => "未启用".to_string(),
+        FilterModeDto::Whitelist => {
+            if keywords.is_empty() {
+                "白名单(空) → 实际不过滤".to_string()
+            } else {
+                format!("白名单: {} 个关键字", keywords.len())
+            }
+        }
+        FilterModeDto::Blacklist => {
+            if keywords.is_empty() {
+                "黑名单(空) → 实际不过滤".to_string()
+            } else {
+                format!("黑名单: {} 个关键字", keywords.len())
+            }
+        }
+    };
+    (ui_mode, text, summary)
+}
+
+impl From<FilterMode> for FilterModeDto {
+    fn from(m: FilterMode) -> Self {
+        match m {
+            FilterMode::Off => FilterModeDto::Off,
+            FilterMode::Whitelist => FilterModeDto::Whitelist,
+            FilterMode::Blacklist => FilterModeDto::Blacklist,
+        }
+    }
 }
 
 /// 把 Windows 系统自带的中文字体注入 egui 的 FontDefinitions。
