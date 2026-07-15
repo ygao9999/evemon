@@ -262,7 +262,7 @@ impl EveMonApp {
 }
 
 impl eframe::App for EveMonApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(300));
 
         let mut query_changed = false;
@@ -439,6 +439,21 @@ impl eframe::App for EveMonApp {
                         if ui.button("📋 复制路径").clicked() {
                             ui.output_mut(|o| o.copied_text = ev.path.clone());
                         }
+                        let path = std::path::Path::new(&ev.path);
+                        if path.exists() {
+                            let drag_btn = ui.add(egui::Button::new("📁 拖动文件 (按住拖拽)").sense(egui::Sense::drag()));
+                            if drag_btn.drag_started() {
+                                if let Ok(window_handle) = frame.window_handle() {
+                                    let _ = drag::start_drag(
+                                        &window_handle,
+                                        drag::DragItem::Files(vec![path.to_path_buf()]),
+                                        drag::Image::Raw(Vec::new()),
+                                        |_, _| {},
+                                        drag::Options::default(),
+                                    );
+                                }
+                            }
+                        }
                         if ui.button("取消选中 (Esc)").clicked() {
                             self.selected_row = None;
                         }
@@ -511,6 +526,9 @@ impl eframe::App for EveMonApp {
                 self.selected_row = None;
             } else {
                 self.selected_row = Some(idx);
+                if let Some(ev) = self.frozen_rows.get(idx) {
+                    ctx.output_mut(|o| o.copied_text = ev.path.clone());
+                }
             }
         }
     }
