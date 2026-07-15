@@ -484,20 +484,21 @@ impl eframe::App for EveMonApp {
                         let idx = row.index();
                         row.set_selected(selected == Some(idx));
                         let ev = &rows[idx];
-                        row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.time_str); });
-                        row.col_sense(egui::Sense::click(), |ui| { ui.label(ev.count.to_string()); });
-                        row.col_sense(egui::Sense::click(), |ui| { ui.label(ev.pid.to_string()); });
-                        row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.process_name); });
-                        row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.operation); });
-                        row.col_sense(egui::Sense::click(), |ui| {
+                        let mut clicked = false;
+                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.time_str); }).1.clicked();
+                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(ev.count.to_string()); }).1.clicked();
+                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(ev.pid.to_string()); }).1.clicked();
+                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.process_name); }).1.clicked();
+                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.operation); }).1.clicked();
+                        clicked |= row.col_sense(egui::Sense::click(), |ui| {
                             ui.add(
                                 egui::Label::new(&ev.path)
                                     .truncate(),
                             );
-                        });
-                        row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.detail); });
-                        let resp = row.response();
-                        if resp.clicked() {
+                        }).1.clicked();
+                        clicked |= row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.detail); }).1.clicked();
+
+                        if clicked {
                             clicked_row = Some(idx);
                         }
                     });
