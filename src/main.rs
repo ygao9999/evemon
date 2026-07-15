@@ -484,18 +484,18 @@ impl eframe::App for EveMonApp {
                         let idx = row.index();
                         row.set_selected(selected == Some(idx));
                         let ev = &rows[idx];
-                        row.col(|ui| { ui.label(&ev.time_str); });
-                        row.col(|ui| { ui.label(ev.count.to_string()); });
-                        row.col(|ui| { ui.label(ev.pid.to_string()); });
-                        row.col(|ui| { ui.label(&ev.process_name); });
-                        row.col(|ui| { ui.label(&ev.operation); });
-                        row.col(|ui| {
+                        row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.time_str); });
+                        row.col_sense(egui::Sense::click(), |ui| { ui.label(ev.count.to_string()); });
+                        row.col_sense(egui::Sense::click(), |ui| { ui.label(ev.pid.to_string()); });
+                        row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.process_name); });
+                        row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.operation); });
+                        row.col_sense(egui::Sense::click(), |ui| {
                             ui.add(
                                 egui::Label::new(&ev.path)
                                     .truncate(),
                             );
                         });
-                        row.col(|ui| { ui.label(&ev.detail); });
+                        row.col_sense(egui::Sense::click(), |ui| { ui.label(&ev.detail); });
                         let resp = row.response();
                         if resp.clicked() {
                             clicked_row = Some(idx);
