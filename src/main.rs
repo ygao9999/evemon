@@ -514,7 +514,7 @@ impl eframe::App for EveMonApp {
                         });
                         row.col(|ui| { ui.label(&ev.detail); });
                         let resp = row.response();
-                        if resp.clicked() || (resp.hovered() && ctx.input(|i| i.pointer.primary_pressed())) {
+                        if resp.clicked() || resp.is_pointer_button_down_on() {
                             clicked_row = Some(idx);
                         }
                     });
