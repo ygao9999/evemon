@@ -1,0 +1,38 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # 先跑 check，比 build 快，能更快看到类型/借用检查的报错
+      - name: cargo check
+        run: cargo check --verbose
+
+      - name: cargo build (release)
+        run: cargo build --release --verbose
+
+      - name: Upload built exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: evemon-windows
+          path: target/release/evemon.exe
