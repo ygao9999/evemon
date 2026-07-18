@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -262,12 +262,21 @@ CREATE INDEX IF NOT EXISTS idx_file_events_last_activity ON file_events(last_act
 /// 内存 SQLite（承担 ETW 回调的高频写入） + 后台线程定期用 SQLite 的
 /// Online Backup API 把内存库整体同步到磁盘文件——这比每条事件都 fsync 一次快得多，
 /// 也比自己攒 buffer 再批量 INSERT 可靠（备份是 SQLite 自己保证一致性的）。
+///
+/// 退出时必须调用 [`EventStore::shutdown`] 停止后台线程后再做最终 flush，否则
+/// eframe 在 `on_exit` 之后立即调用 `std::process::exit(0)` 会强杀正在 flush
+/// 的后台线程，导致磁盘文件损坏、重启后数据丢失。
 pub struct EventStore {
     mem: Mutex<Connection>,
     disk_path: PathBuf,
     /// 单调递增的活动序号。每次 insert 调用 fetch_add(1)，作为 last_activity 写入。
     /// 启动时从 MAX(last_activity)+1 开始，保证跨重启的排序正确。
     activity_counter: AtomicI64,
+    /// 后台落盘线程的关闭标志。设为 true 后线程在下一次循环检查时退出。
+    shutdown: AtomicBool,
+    /// 后台落盘线程的 JoinHandle。shutdown() 里 join 它以确保线程完全退出
+    /// 后才做最终 flush，避免和 std::process::exit 竞争。
+    flush_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl EventStore {
@@ -287,6 +296,7 @@ impl EventStore {
             // 完成后 backup 被 drop、可变借用才释放，后面才能继续用 mem_conn 做迁移检查。
             {
                 let disk_conn = Connection::open(&disk_path)?;
+                disk_conn.busy_timeout(Duration::from_secs(5))?;
                 let backup = Backup::new(&disk_conn, &mut mem_conn)?;
                 backup.run_to_completion(100, Duration::from_millis(0), None)?;
                 // backup + disk_conn 在这里 drop
@@ -310,6 +320,7 @@ impl EventStore {
             mem_conn.execute_batch(SCHEMA)?;
             mem_conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
             let disk_conn = Connection::open(&disk_path)?;
+            disk_conn.busy_timeout(Duration::from_secs(5))?;
             disk_conn.execute_batch(SCHEMA)?;
             disk_conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         }
@@ -323,21 +334,62 @@ impl EventStore {
 
         let store = Arc::new(Self {
             mem: Mutex::new(mem_conn),
-            disk_path,
+            disk_path: disk_path.clone(),
             activity_counter: AtomicI64::new(init_counter),
+            shutdown: AtomicBool::new(false),
+            flush_thread: Mutex::new(None),
         });
 
         if flush_interval > Duration::ZERO {
             let store = store.clone();
-            std::thread::spawn(move || loop {
+            let handle = std::thread::spawn(move || loop {
                 std::thread::sleep(flush_interval);
+                // 先检查 shutdown 标志，设置了就立刻退出，不再做 flush
+                if store.shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 if let Err(e) = store.flush_to_disk() {
-                    eprintln!("[EventStore] 落盘失败: {e:?}");
+                    store.log_error(&format!("后台落盘失败: {e:?}"));
                 }
             });
+            *store.flush_thread.lock() = Some(handle);
         }
 
         Ok(store)
+    }
+
+    /// 停止后台落盘线程并等待其完全退出。
+    ///
+    /// 必须在 `on_exit` 里、最终 `flush_to_disk` 之前调用。否则 eframe 在
+    /// `on_exit` 之后立即 `std::process::exit(0)`，会强杀正在 flush 的后台线程，
+    /// 可能导致磁盘 SQLite 文件写了一半（页损坏），重启后加载不到数据。
+    ///
+    /// 调用此方法后后台线程保证已退出，后续的 `flush_to_disk` 不会和任何线程竞争。
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.flush_thread.lock().take() {
+            // join 等待线程退出。线程可能正在 flush（持有 mem_conn 锁），
+            // join 不会死锁——它只是等线程结束，不锁 mem_conn。
+            if let Err(e) = handle.join() {
+                self.log_error(&format!("后台落盘线程 join 失败: {e:?}"));
+            }
+        }
+    }
+
+    /// 把错误信息追加写入磁盘库同目录的 `.log` 文件。
+    /// GUI 应用没有控制台，`eprintln!` 输出用户看不到，必须写文件才能诊断问题。
+    fn log_error(&self, msg: &str) {
+        let log_path = self.disk_path.with_extension("log");
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let line = format!("[{timestamp}] {msg}\n");
+        // 追加写入，失败就放弃（不能因为日志写不了就 panic）
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+        // 同时也 eprintln，有控制台的情况下能看到
+        eprintln!("[EventStore] {msg}");
     }
 
     /// 插入一条事件。同一个 path 在表里只允许一行——重复路径触发的 ON CONFLICT
@@ -418,11 +470,22 @@ impl EventStore {
     }
 
     /// 把内存库整体同步覆盖到磁盘文件。
+    ///
+    /// 磁盘连接设置了 `busy_timeout(5000)`，遇到文件锁（杀毒软件扫描、另一进程
+    /// 打开等）时会等待最多 5 秒而不是立即报 `SQLITE_BUSY` 错误。
     pub fn flush_to_disk(&self) -> anyhow::Result<()> {
         let mem_conn = self.mem.lock();
         let mut disk_conn = Connection::open(&self.disk_path)?;
+        // 设置 busy_timeout：如果磁盘文件被其他进程/线程锁住（杀毒软件扫描、
+        // SQLite 查看器等），等待最多 5 秒而不是立即失败。
+        disk_conn.busy_timeout(Duration::from_secs(5))?;
         let backup = Backup::new(&mem_conn, &mut disk_conn)?;
-        backup.run_to_completion(100, Duration::from_millis(5), None)?;
+        // sleep_ms 设为 0：我们已经在 mem_conn 锁的保护下，不需要让出给其他线程。
+        // 原来的 5ms sleep 只是在分页之间让出 CPU，但持锁睡眠反而会阻塞 insert 更久。
+        backup.run_to_completion(100, Duration::from_millis(0), None)?;
+        // disk_conn 在这里 drop，SQLite 关闭连接时会 flush 页缓存到磁盘。
+        // 必须在 drop 之后、函数返回之前确保数据落盘。
+        drop(disk_conn);
         Ok(())
     }
 }
@@ -458,42 +521,129 @@ mod tests {
         }
     }
 
-    /// 复现"写入 → 落盘 → 重新打开 → 数据消失"的 bug。
+    fn test_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "evemon_test_{}_{}.sqlite3",
+            std::process::id(),
+            name
+        ))
+    }
+
+    /// 基础复现测试：写入 → 落盘 → 重新打开 → 数据应该在。
     #[test]
     fn roundtrip_persist_and_reload() {
-        let tmp = std::env::temp_dir().join(format!(
-            "evemon_test_{}.sqlite3",
-            std::process::id()
-        ));
+        let tmp = test_db_path("basic");
         let _ = std::fs::remove_file(&tmp);
 
-        // 第一次：打开、插入、落盘、关闭
         {
             let store = EventStore::open(tmp.clone(), Duration::ZERO).unwrap();
             store.insert(&make_event("C:\\foo\\bar.txt")).unwrap();
             store.insert(&make_event("C:\\foo\\baz.txt")).unwrap();
             assert_eq!(store.count().unwrap(), 2, "插入后应有 2 条");
             store.flush_to_disk().unwrap();
-            println!(
-                "[test] 落盘后磁盘文件大小: {} 字节",
-                std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0)
+        }
+
+        {
+            let store = EventStore::open(tmp.clone(), Duration::ZERO).unwrap();
+            assert_eq!(
+                store.count().unwrap(),
+                2,
+                "重新打开后应该还能看到 2 条数据"
             );
         }
 
-        // 第二次：重新打开，检查数据是否还在
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 测试带后台线程的完整生命周期：open(有后台线程) → insert → shutdown → flush → reopen。
+    /// 这模拟真实 App 的退出流程：on_exit 调 shutdown() 停后台线程，再 flush_to_disk。
+    #[test]
+    fn flush_with_background_thread_then_shutdown() {
+        let tmp = test_db_path("bgthread");
+        let _ = std::fs::remove_file(&tmp);
+
+        {
+            // 启动带后台落盘线程的 store（100ms 间隔）
+            let store = EventStore::open(tmp.clone(), Duration::from_millis(100)).unwrap();
+            store.insert(&make_event("C:\\alpha.txt")).unwrap();
+            store.insert(&make_event("C:\\beta.txt")).unwrap();
+
+            // 等后台线程至少跑一次 flush
+            std::thread::sleep(Duration::from_millis(300));
+
+            // 模拟 on_exit：先 shutdown 停后台线程，再最终 flush
+            store.shutdown();
+            store.flush_to_disk().unwrap();
+        }
+
         {
             let store = EventStore::open(tmp.clone(), Duration::ZERO).unwrap();
             let count = store.count().unwrap();
-            println!("[test] 重新打开后 count = {}", count);
+            assert_eq!(count, 2, "带后台线程的 store 退出后数据应该在，但只有 {count}");
+        }
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 测试多次 flush 到同一个文件（覆盖写）。
+    /// 每次 flush 都用 Backup API 覆盖磁盘库，验证不会因目标非空而失败或损坏。
+    #[test]
+    fn multiple_flushes_to_same_file() {
+        let tmp = test_db_path("multiflush");
+        let _ = std::fs::remove_file(&tmp);
+
+        {
+            let store = EventStore::open(tmp.clone(), Duration::ZERO).unwrap();
+
+            // 第一次 flush：2 条
+            store.insert(&make_event("C:\\first.txt")).unwrap();
+            store.insert(&make_event("C:\\second.txt")).unwrap();
+            store.flush_to_disk().unwrap();
+
+            // 第二次 flush：增加第 3 条，覆盖磁盘
+            store.insert(&make_event("C:\\third.txt")).unwrap();
+            store.flush_to_disk().unwrap();
+
+            // 第三次 flush：更新 first.txt 的 count
+            store.insert(&make_event("C:\\first.txt")).unwrap();
+            store.flush_to_disk().unwrap();
+        }
+
+        {
+            let store = EventStore::open(tmp.clone(), Duration::ZERO).unwrap();
+            assert_eq!(store.count().unwrap(), 3, "应有 3 条唯一路径");
             let rows = store.recent(100).unwrap();
-            println!("[test] 重新打开后 recent 返回 {} 行", rows.len());
-            for r in &rows {
-                println!("[test]   行: path={}", r.path);
-            }
-            assert_eq!(
-                count, 2,
-                "重新打开后应该还能看到 2 条数据，但实际只有 {count}"
-            );
+            let first = rows.iter().find(|e| e.path == "C:\\first.txt").unwrap();
+            assert_eq!(first.count, 2, "first.txt 的 count 应该是 2（被 insert 了两次）");
+        }
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 测试 shutdown 后再调用 flush_to_disk 不会出问题（模拟 on_exit 的完整流程）。
+    #[test]
+    fn shutdown_then_flush_is_safe() {
+        let tmp = test_db_path("shutdown_flush");
+        let _ = std::fs::remove_file(&tmp);
+
+        {
+            let store = EventStore::open(tmp.clone(), Duration::from_millis(50)).unwrap();
+            store.insert(&make_event("C:\\data.txt")).unwrap();
+
+            // 等后台线程 flush 一次
+            std::thread::sleep(Duration::from_millis(150));
+
+            // shutdown 后再 flush —— 不应该 panic 或死锁
+            store.shutdown();
+            store.flush_to_disk().unwrap();
+
+            // 再次 shutdown 是 no-op（handle 已经 take 了）
+            store.shutdown();
+        }
+
+        {
+            let store = EventStore::open(tmp.clone(), Duration::ZERO).unwrap();
+            assert_eq!(store.count().unwrap(), 1, "数据应该在");
         }
 
         let _ = std::fs::remove_file(&tmp);

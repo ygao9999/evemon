@@ -607,6 +607,10 @@ impl eframe::App for EveMonApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         println!("[EveMonApp] 正在退出，执行最终落盘...");
+        // 先停止后台落盘线程并等待其退出。eframe 在 on_exit 之后会立即调用
+        // std::process::exit(0)，如果不先停线程，正在 flush 的后台线程会被强杀，
+        // 磁盘文件可能写了一半导致重启后数据丢失。
+        self.store.shutdown();
         if let Err(e) = self.store.flush_to_disk() {
             eprintln!("[EveMonApp] 退出时落盘失败: {e:?}");
         } else {
