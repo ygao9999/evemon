@@ -426,11 +426,23 @@ impl EventStore {
             ],
         )?;
 
-        // 简单粗暴的裁剪：每次插入顺手删一次超出上限的老记录（按 last_activity 排）。
-        // 在内存库里做这个非常快，量级到万级别没有可感知的开销。
+        // 按行数裁剪：当唯一路径数超过 MAX_ROWS 时，只保留最近活跃的 MAX_ROWS 行。
+        //
+        // 旧实现按 last_activity 跨度裁剪（DELETE WHERE last_activity <= MAX-20000），
+        // 但 last_activity 每次 insert 都 +1（含重复路径的 ON CONFLICT），高频 ETW
+        // 事件下几分钟 activity_counter 就涨到 20000+，导致全表只有几百行时也大量
+        // 删除"不活跃"路径——total_count 反常下降。改为按行数裁剪后，行数不超过
+        // MAX_ROWS 就不会删任何东西。
+        //
+        // LIMIT -1 OFFSET ?1：跳过最近活跃的 MAX_ROWS 行，删除其余所有行。
+        // 行数 <= MAX_ROWS 时 OFFSET 取不到行，DELETE 不删任何东西。
         conn.execute(
             "DELETE FROM file_events
-             WHERE last_activity <= (SELECT COALESCE(MAX(last_activity), 0) FROM file_events) - ?1",
+             WHERE seq IN (
+                 SELECT seq FROM file_events
+                 ORDER BY last_activity DESC
+                 LIMIT -1 OFFSET ?1
+             )",
             params![MAX_ROWS],
         )?;
         Ok(())
@@ -645,6 +657,81 @@ mod tests {
             let store = EventStore::open(tmp.clone(), Duration::ZERO).unwrap();
             assert_eq!(store.count().unwrap(), 1, "数据应该在");
         }
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 复现"total_count 反常下降"的 bug：少量唯一路径 + 高频重复访问。
+    ///
+    /// 旧裁剪逻辑按 last_activity 跨度删（DELETE WHERE last_activity <= MAX-20000），
+    /// 但 last_activity 每次 insert 都 +1（含重复路径），高频事件下 activity_counter
+    /// 很快超过 MAX_ROWS，导致全表才几十行时也把"不活跃"路径删掉。
+    ///
+    /// 修复后按行数裁剪：行数 <= MAX_ROWS 时一条都不删。
+    #[test]
+    fn count_does_not_decrease_with_high_freq_repeats() {
+        let tmp = test_db_path("highfreq");
+        let _ = std::fs::remove_file(&tmp);
+
+        let store = EventStore::open(tmp.clone(), Duration::ZERO).unwrap();
+
+        // 插入 5 个唯一路径
+        let paths = ["C:\\a.txt", "C:\\b.txt", "C:\\c.txt", "C:\\d.txt", "C:\\e.txt"];
+        for p in &paths {
+            store.insert(&make_event(p)).unwrap();
+        }
+        assert_eq!(store.count().unwrap(), 5, "初始 5 条唯一路径");
+
+        // 对 e.txt 高频重复插入，让 activity_counter 远超 MAX_ROWS(20000)
+        // 旧逻辑此时会把 a/b/c/d（last_activity 很小）全部删掉
+        for _ in 0..(MAX_ROWS + 10) {
+            store.insert(&make_event("C:\\e.txt")).unwrap();
+        }
+
+        let count = store.count().unwrap();
+        assert_eq!(
+            count, 5,
+            "高频重复插入后唯一路径数应仍为 5，但实际为 {count}（旧裁剪 bug 会导致路径被误删）"
+        );
+
+        // 验证最早插入的 a.txt 还在
+        let rows = store.recent(100).unwrap();
+        let still_has_a = rows.iter().any(|e| e.path == "C:\\a.txt");
+        assert!(still_has_a, "a.txt 应该还在，不应被裁剪删掉");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 测试超过 MAX_ROWS 时确实会裁剪到 MAX_ROWS 行（保留最近活跃的）。
+    #[test]
+    fn trims_to_max_rows_when_exceeded() {
+        let tmp = test_db_path("trim");
+        let _ = std::fs::remove_file(&tmp);
+
+        let store = EventStore::open(tmp.clone(), Duration::ZERO).unwrap();
+
+        // 插入 MAX_ROWS + 50 个唯一路径，按顺序插入
+        // 最早插入的 50 个应该被裁剪掉（last_activity 最小）
+        for i in 0..(MAX_ROWS + 50) {
+            let path = format!("C:\\file_{i}.txt");
+            store.insert(&make_event(&path)).unwrap();
+        }
+
+        let count = store.count().unwrap();
+        assert_eq!(
+            count, MAX_ROWS,
+            "插入 {} 条唯一路径后应裁剪到 {} 条，实际 {count}",
+            MAX_ROWS + 50,
+            MAX_ROWS
+        );
+
+        // 最早的 50 个应该被删了，file_0 ~ file_49 不应存在
+        let rows = store.recent(MAX_ROWS + 100).unwrap();
+        let has_file_0 = rows.iter().any(|e| e.path == "C:\\file_0.txt");
+        assert!(!has_file_0, "file_0.txt 应该已被裁剪删除");
+        // file_50 及之后的应该还在
+        let has_file_50 = rows.iter().any(|e| e.path == "C:\\file_50.txt");
+        assert!(has_file_50, "file_50.txt 应该保留");
 
         let _ = std::fs::remove_file(&tmp);
     }
