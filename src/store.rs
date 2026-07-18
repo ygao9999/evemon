@@ -341,15 +341,15 @@ impl EventStore {
         });
 
         if flush_interval > Duration::ZERO {
-            let store = store.clone();
+            let store_clone = store.clone();
             let handle = std::thread::spawn(move || loop {
                 std::thread::sleep(flush_interval);
                 // 先检查 shutdown 标志，设置了就立刻退出，不再做 flush
-                if store.shutdown.load(Ordering::Relaxed) {
+                if store_clone.shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Err(e) = store.flush_to_disk() {
-                    store.log_error(&format!("后台落盘失败: {e:?}"));
+                if let Err(e) = store_clone.flush_to_disk() {
+                    store_clone.log_error(&format!("后台落盘失败: {e:?}"));
                 }
             });
             *store.flush_thread.lock() = Some(handle);
@@ -483,9 +483,9 @@ impl EventStore {
         // sleep_ms 设为 0：我们已经在 mem_conn 锁的保护下，不需要让出给其他线程。
         // 原来的 5ms sleep 只是在分页之间让出 CPU，但持锁睡眠反而会阻塞 insert 更久。
         backup.run_to_completion(100, Duration::from_millis(0), None)?;
-        // disk_conn 在这里 drop，SQLite 关闭连接时会 flush 页缓存到磁盘。
-        // 必须在 drop 之后、函数返回之前确保数据落盘。
-        drop(disk_conn);
+        // Rust 按逆序 drop：backup 先 drop（释放对 disk_conn 的借用），
+        // 然后 disk_conn drop（SQLite 关闭连接并 flush 页缓存到磁盘），
+        // 最后 mem_conn 的 MutexGuard drop（释放锁）。
         Ok(())
     }
 }
