@@ -302,6 +302,20 @@ impl eframe::App for EveMonApp {
                         eprintln!("手动落盘失败: {e:?}");
                     }
                 }
+                ui.add_space(8.0);
+                ui.label("落盘间隔(秒):");
+                let mut interval = self.flush_interval_secs as i64;
+                let drag = egui::DragValue::new(&mut interval)
+                    .range(0..=3600)
+                    .speed(1);
+                if ui.add(drag).changed() {
+                    self.flush_interval_secs = interval.max(0) as u64;
+                    // 立即保存到配置文件，下次启动生效
+                    self.apply_filters_and_save();
+                }
+                if self.flush_interval_secs == 0 {
+                    ui.label("(0=仅退出时落盘)");
+                }
             });
             ui.add_space(4.0);
             let refresh_status = if self.paused {

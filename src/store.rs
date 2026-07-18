@@ -441,3 +441,61 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<FileEvent> {
         first_seen: row.get(9)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn make_event(path: &str) -> NewFileEvent {
+        NewFileEvent {
+            time_str: "2026-01-01 00:00:00".to_string(),
+            pid: 1234,
+            process_name: "test.exe".to_string(),
+            operation: "open".to_string(),
+            path: path.to_string(),
+            detail: String::new(),
+        }
+    }
+
+    /// 复现"写入 → 落盘 → 重新打开 → 数据消失"的 bug。
+    #[test]
+    fn roundtrip_persist_and_reload() {
+        let tmp = std::env::temp_dir().join(format!(
+            "evemon_test_{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        // 第一次：打开、插入、落盘、关闭
+        {
+            let store = EventStore::open(tmp.clone(), Duration::ZERO).unwrap();
+            store.insert(&make_event("C:\\foo\\bar.txt")).unwrap();
+            store.insert(&make_event("C:\\foo\\baz.txt")).unwrap();
+            assert_eq!(store.count().unwrap(), 2, "插入后应有 2 条");
+            store.flush_to_disk().unwrap();
+            println!(
+                "[test] 落盘后磁盘文件大小: {} 字节",
+                std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0)
+            );
+        }
+
+        // 第二次：重新打开，检查数据是否还在
+        {
+            let store = EventStore::open(tmp.clone(), Duration::ZERO).unwrap();
+            let count = store.count().unwrap();
+            println!("[test] 重新打开后 count = {}", count);
+            let rows = store.recent(100).unwrap();
+            println!("[test] 重新打开后 recent 返回 {} 行", rows.len());
+            for r in &rows {
+                println!("[test]   行: path={}", r.path);
+            }
+            assert_eq!(
+                count, 2,
+                "重新打开后应该还能看到 2 条数据，但实际只有 {count}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+}

@@ -28,6 +28,10 @@ jobs:
       - name: cargo check
         run: cargo check --verbose
 
+      # 跑单元测试（含 store.rs 里的落盘/重载复现测试），--nocapture 让 println 输出可见
+      - name: cargo test
+        run: cargo test --verbose -- --nocapture
+
       - name: cargo build (release)
         run: cargo build --release --verbose
 
